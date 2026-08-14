@@ -63,8 +63,43 @@ func newDownloader(ctx context.Context, dispatcher routing.Dispatcher, outbound 
 	}
 }
 
+func DownloadMissingAssets(ctx context.Context, assets []*Asset) error {
+	missing := make([]*Asset, 0, len(assets))
+	for _, asset := range assets {
+		if _, err := filesystem.StatAsset(asset.File); err != nil {
+			if !go_errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			missing = append(missing, asset)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	d := newDownloader(ctx, nil, "")
+	staged, err := d.download(missing)
+	if err != nil {
+		return err
+	}
+	defer clean(staged)
+
+	tx, err := swapAll(staged)
+	if err != nil {
+		return err
+	}
+	return tx.commit()
+}
+
 func newClient(baseCtx context.Context, dispatcher routing.Dispatcher, outbound string, isHTTPS bool) *http.Client {
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		if dispatcher == nil {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return &idleConn{Conn: conn}, nil
+		}
 		var conn net.Conn
 		err := task.Run(ctx, func() error {
 			if tagged.Dialer == nil {
@@ -190,7 +225,9 @@ func (d *downloader) downloadOne(asset *Asset) (stage, error) {
 }
 
 func (d *downloader) fetch(rawURL string, writer io.Writer) error {
-	req, err := http.NewRequestWithContext(d.ctx, http.MethodGet, rawURL, nil)
+	ctx, cancel := context.WithTimeout(d.ctx, idleTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}

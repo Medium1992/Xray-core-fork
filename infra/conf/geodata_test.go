@@ -1,6 +1,7 @@
 package conf_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -9,7 +10,7 @@ import (
 )
 
 func TestGeodataConfig(t *testing.T) {
-	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	t.Setenv("xray.location.asset", t.TempDir())
 
 	creator := func() Buildable {
 		return new(GeodataConfig)
@@ -39,7 +40,11 @@ func TestGeodataConfig(t *testing.T) {
 }
 
 func TestGeodataAssetConfig(t *testing.T) {
-	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	dir := t.TempDir()
+	t.Setenv("xray.location.asset", dir)
+	if err := os.WriteFile(filepath.Join(dir, "geoip.dat"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := (&GeodataAssetConfig{
 		URL:  "https://example.com/geoip.dat",
@@ -51,13 +56,17 @@ func TestGeodataAssetConfig(t *testing.T) {
 	if _, err := (&GeodataAssetConfig{
 		URL:  "https://example.com/geoip.dat",
 		File: "missing.dat",
-	}).Build(); err == nil {
-		t.Fatal("expected error")
+	}).Build(); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestGeodataAssetConfigInvalidURL(t *testing.T) {
-	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	dir := t.TempDir()
+	t.Setenv("xray.location.asset", dir)
+	if err := os.WriteFile(filepath.Join(dir, "geoip.dat"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, rawURL := range []string{
 		"",
