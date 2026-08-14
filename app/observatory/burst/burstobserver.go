@@ -74,11 +74,28 @@ func (o *Observer) Start() error {
 				return nil, errors.New("outbound.Manager is not a HandlerSelector")
 			}
 
-			outbounds := hs.Select(o.config.SubjectSelector)
+			outbounds := o.selectOutbounds(hs)
 			return outbounds, nil
 		})
 	}
 	return nil
+}
+
+func (o *Observer) selectOutbounds(hs outbound.HandlerSelector) []string {
+	outbounds := hs.Select(o.config.SubjectSelector)
+	if !o.config.UseOutboundTag {
+		return outbounds
+	}
+	selected := make([]string, 0, len(o.config.OutboundTag))
+	for _, tag := range outbounds {
+		for _, selectedTag := range o.config.OutboundTag {
+			if tag == selectedTag {
+				selected = append(selected, tag)
+				break
+			}
+		}
+	}
+	return selected
 }
 
 func (o *Observer) Close() error {

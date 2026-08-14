@@ -374,6 +374,8 @@ type Config struct {
 	ProbeUrl          string   `protobuf:"bytes,3,opt,name=probe_url,json=probeUrl,proto3" json:"probe_url,omitempty"`
 	ProbeInterval     int64    `protobuf:"varint,4,opt,name=probe_interval,json=probeInterval,proto3" json:"probe_interval,omitempty"`
 	EnableConcurrency bool     `protobuf:"varint,5,opt,name=enable_concurrency,json=enableConcurrency,proto3" json:"enable_concurrency,omitempty"`
+	OutboundTag       []string `protobuf:"bytes,6,rep,name=outbound_tag,json=outboundTag,proto3" json:"outbound_tag,omitempty"`
+	UseOutboundTag    bool     `protobuf:"varint,7,opt,name=use_outbound_tag,json=useOutboundTag,proto3" json:"use_outbound_tag,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -436,6 +438,20 @@ func (x *Config) GetEnableConcurrency() bool {
 	return false
 }
 
+func (x *Config) GetOutboundTag() []string {
+	if x != nil {
+		return x.OutboundTag
+	}
+	return nil
+}
+
+func (x *Config) GetUseOutboundTag() bool {
+	if x != nil {
+		return x.UseOutboundTag
+	}
+	return false
+}
+
 var File_app_observatory_config_proto protoreflect.FileDescriptor
 
 const file_app_observatory_config_proto_rawDesc = "" +
@@ -464,12 +480,14 @@ const file_app_observatory_config_proto_rawDesc = "" +
 	"\x05delay\x18\x02 \x01(\x03R\x05delay\x12*\n" +
 	"\x11last_error_reason\x18\x03 \x01(\tR\x0flastErrorReason\"2\n" +
 	"\tIntensity\x12%\n" +
-	"\x0eprobe_interval\x18\x01 \x01(\rR\rprobeInterval\"\xa6\x01\n" +
+	"\x0eprobe_interval\x18\x01 \x01(\rR\rprobeInterval\"\xf3\x01\n" +
 	"\x06Config\x12)\n" +
 	"\x10subject_selector\x18\x02 \x03(\tR\x0fsubjectSelector\x12\x1b\n" +
 	"\tprobe_url\x18\x03 \x01(\tR\bprobeUrl\x12%\n" +
 	"\x0eprobe_interval\x18\x04 \x01(\x03R\rprobeInterval\x12-\n" +
-	"\x12enable_concurrency\x18\x05 \x01(\bR\x11enableConcurrencyB^\n" +
+	"\x12enable_concurrency\x18\x05 \x01(\bR\x11enableConcurrency\x12!\n" +
+	"\foutbound_tag\x18\x06 \x03(\tR\voutboundTag\x12(\n" +
+	"\x10use_outbound_tag\x18\a \x01(\bR\x0euseOutboundTagB^\n" +
 	"\x18com.xray.app.observatoryP\x01Z)github.com/xtls/xray-core/app/observatory\xaa\x02\x14Xray.App.Observatoryb\x06proto3"
 
 var (

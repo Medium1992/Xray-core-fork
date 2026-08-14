@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+import "app/observatory/config.proto";
+
 package xray.core.app.observatory.burst;
 option csharp_namespace = "Xray.App.Observatory.Burst";
 option go_package = "github.com/xtls/xray-core/app/observatory/burst";
@@ -12,6 +14,19 @@ message Config {
   repeated string subject_selector = 2;
 
   HealthPingConfig ping_config = 3;
+
+  repeated string outbound_tag = 4;
+
+  bool use_outbound_tag = 5;
+}
+
+message ObservatoryConfig {
+  xray.core.app.observatory.Config config = 1;
+}
+
+message MultipleConfig {
+  repeated ObservatoryConfig observatory = 1;
+  repeated Config burst_observatory = 2;
 }
 
 message HealthPingConfig {

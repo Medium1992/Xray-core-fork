@@ -7,6 +7,7 @@
 package burst
 
 import (
+	observatory "github.com/xtls/xray-core/app/observatory"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -26,6 +27,8 @@ type Config struct {
 	// @Document The selectors for outbound under observation
 	SubjectSelector []string          `protobuf:"bytes,2,rep,name=subject_selector,json=subjectSelector,proto3" json:"subject_selector,omitempty"`
 	PingConfig      *HealthPingConfig `protobuf:"bytes,3,opt,name=ping_config,json=pingConfig,proto3" json:"ping_config,omitempty"`
+	OutboundTag     []string          `protobuf:"bytes,4,rep,name=outbound_tag,json=outboundTag,proto3" json:"outbound_tag,omitempty"`
+	UseOutboundTag  bool              `protobuf:"varint,5,opt,name=use_outbound_tag,json=useOutboundTag,proto3" json:"use_outbound_tag,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -74,6 +77,116 @@ func (x *Config) GetPingConfig() *HealthPingConfig {
 	return nil
 }
 
+func (x *Config) GetOutboundTag() []string {
+	if x != nil {
+		return x.OutboundTag
+	}
+	return nil
+}
+
+func (x *Config) GetUseOutboundTag() bool {
+	if x != nil {
+		return x.UseOutboundTag
+	}
+	return false
+}
+
+type ObservatoryConfig struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Config        *observatory.Config    `protobuf:"bytes,1,opt,name=config,proto3" json:"config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ObservatoryConfig) Reset() {
+	*x = ObservatoryConfig{}
+	mi := &file_app_observatory_burst_config_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ObservatoryConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ObservatoryConfig) ProtoMessage() {}
+
+func (x *ObservatoryConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_app_observatory_burst_config_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ObservatoryConfig.ProtoReflect.Descriptor instead.
+func (*ObservatoryConfig) Descriptor() ([]byte, []int) {
+	return file_app_observatory_burst_config_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ObservatoryConfig) GetConfig() *observatory.Config {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
+type MultipleConfig struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Observatory      []*ObservatoryConfig   `protobuf:"bytes,1,rep,name=observatory,proto3" json:"observatory,omitempty"`
+	BurstObservatory []*Config              `protobuf:"bytes,2,rep,name=burst_observatory,json=burstObservatory,proto3" json:"burst_observatory,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *MultipleConfig) Reset() {
+	*x = MultipleConfig{}
+	mi := &file_app_observatory_burst_config_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MultipleConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MultipleConfig) ProtoMessage() {}
+
+func (x *MultipleConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_app_observatory_burst_config_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MultipleConfig.ProtoReflect.Descriptor instead.
+func (*MultipleConfig) Descriptor() ([]byte, []int) {
+	return file_app_observatory_burst_config_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *MultipleConfig) GetObservatory() []*ObservatoryConfig {
+	if x != nil {
+		return x.Observatory
+	}
+	return nil
+}
+
+func (x *MultipleConfig) GetBurstObservatory() []*Config {
+	if x != nil {
+		return x.BurstObservatory
+	}
+	return nil
+}
+
 type HealthPingConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// destination url, need 204 for success return
@@ -95,7 +208,7 @@ type HealthPingConfig struct {
 
 func (x *HealthPingConfig) Reset() {
 	*x = HealthPingConfig{}
-	mi := &file_app_observatory_burst_config_proto_msgTypes[1]
+	mi := &file_app_observatory_burst_config_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -107,7 +220,7 @@ func (x *HealthPingConfig) String() string {
 func (*HealthPingConfig) ProtoMessage() {}
 
 func (x *HealthPingConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_app_observatory_burst_config_proto_msgTypes[1]
+	mi := &file_app_observatory_burst_config_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -120,7 +233,7 @@ func (x *HealthPingConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthPingConfig.ProtoReflect.Descriptor instead.
 func (*HealthPingConfig) Descriptor() ([]byte, []int) {
-	return file_app_observatory_burst_config_proto_rawDescGZIP(), []int{1}
+	return file_app_observatory_burst_config_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *HealthPingConfig) GetDestination() string {
@@ -169,11 +282,18 @@ var File_app_observatory_burst_config_proto protoreflect.FileDescriptor
 
 const file_app_observatory_burst_config_proto_rawDesc = "" +
 	"\n" +
-	"\"app/observatory/burst/config.proto\x12\x1fxray.core.app.observatory.burst\"\x87\x01\n" +
+	"\"app/observatory/burst/config.proto\x12\x1fxray.core.app.observatory.burst\x1a\x1capp/observatory/config.proto\"\xd4\x01\n" +
 	"\x06Config\x12)\n" +
 	"\x10subject_selector\x18\x02 \x03(\tR\x0fsubjectSelector\x12R\n" +
 	"\vping_config\x18\x03 \x01(\v21.xray.core.app.observatory.burst.HealthPingConfigR\n" +
-	"pingConfig\"\xd4\x01\n" +
+	"pingConfig\x12!\n" +
+	"\foutbound_tag\x18\x04 \x03(\tR\voutboundTag\x12(\n" +
+	"\x10use_outbound_tag\x18\x05 \x01(\bR\x0euseOutboundTag\"N\n" +
+	"\x11ObservatoryConfig\x129\n" +
+	"\x06config\x18\x01 \x01(\v2!.xray.core.app.observatory.ConfigR\x06config\"\xbc\x01\n" +
+	"\x0eMultipleConfig\x12T\n" +
+	"\vobservatory\x18\x01 \x03(\v22.xray.core.app.observatory.burst.ObservatoryConfigR\vobservatory\x12T\n" +
+	"\x11burst_observatory\x18\x02 \x03(\v2'.xray.core.app.observatory.burst.ConfigR\x10burstObservatory\"\xd4\x01\n" +
 	"\x10HealthPingConfig\x12 \n" +
 	"\vdestination\x18\x01 \x01(\tR\vdestination\x12\"\n" +
 	"\fconnectivity\x18\x02 \x01(\tR\fconnectivity\x12\x1a\n" +
@@ -197,18 +317,24 @@ func file_app_observatory_burst_config_proto_rawDescGZIP() []byte {
 	return file_app_observatory_burst_config_proto_rawDescData
 }
 
-var file_app_observatory_burst_config_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_app_observatory_burst_config_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_app_observatory_burst_config_proto_goTypes = []any{
-	(*Config)(nil),           // 0: xray.core.app.observatory.burst.Config
-	(*HealthPingConfig)(nil), // 1: xray.core.app.observatory.burst.HealthPingConfig
+	(*Config)(nil),             // 0: xray.core.app.observatory.burst.Config
+	(*ObservatoryConfig)(nil),  // 1: xray.core.app.observatory.burst.ObservatoryConfig
+	(*MultipleConfig)(nil),     // 2: xray.core.app.observatory.burst.MultipleConfig
+	(*HealthPingConfig)(nil),   // 3: xray.core.app.observatory.burst.HealthPingConfig
+	(*observatory.Config)(nil), // 4: xray.core.app.observatory.Config
 }
 var file_app_observatory_burst_config_proto_depIdxs = []int32{
-	1, // 0: xray.core.app.observatory.burst.Config.ping_config:type_name -> xray.core.app.observatory.burst.HealthPingConfig
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	3, // 0: xray.core.app.observatory.burst.Config.ping_config:type_name -> xray.core.app.observatory.burst.HealthPingConfig
+	4, // 1: xray.core.app.observatory.burst.ObservatoryConfig.config:type_name -> xray.core.app.observatory.Config
+	1, // 2: xray.core.app.observatory.burst.MultipleConfig.observatory:type_name -> xray.core.app.observatory.burst.ObservatoryConfig
+	0, // 3: xray.core.app.observatory.burst.MultipleConfig.burst_observatory:type_name -> xray.core.app.observatory.burst.Config
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_app_observatory_burst_config_proto_init() }
@@ -222,7 +348,7 @@ func file_app_observatory_burst_config_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_app_observatory_burst_config_proto_rawDesc), len(file_app_observatory_burst_config_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
