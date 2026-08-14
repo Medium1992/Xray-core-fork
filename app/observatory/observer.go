@@ -69,7 +69,7 @@ func (o *Observer) background() {
 			return
 		}
 
-		outbounds := hs.Select(o.config.SubjectSelector)
+		outbounds := o.selectOutbounds(hs)
 
 		o.clearRemovedOutbounds(outbounds)
 
@@ -110,6 +110,20 @@ func (o *Observer) background() {
 		}
 		time.Sleep(sleepTime)
 	}
+}
+
+func (o *Observer) selectOutbounds(hs outbound.HandlerSelector) []string {
+	outbounds := hs.Select(o.config.SubjectSelector)
+	if !o.config.UseOutboundTag {
+		return outbounds
+	}
+	selected := make([]string, 0, len(o.config.OutboundTag))
+	for _, tag := range outbounds {
+		if slices.Contains(o.config.OutboundTag, tag) {
+			selected = append(selected, tag)
+		}
+	}
+	return selected
 }
 
 func (o *Observer) clearRemovedOutbounds(outbounds []string) {

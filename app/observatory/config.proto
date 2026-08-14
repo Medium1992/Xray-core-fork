@@ -81,4 +81,8 @@ message Config {
   int64 probe_interval = 4;
 
   bool enable_concurrency = 5;
+
+  repeated string outbound_tag = 6;
+
+  bool use_outbound_tag = 7;
 }

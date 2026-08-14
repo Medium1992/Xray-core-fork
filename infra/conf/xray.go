@@ -405,8 +405,8 @@ type Config struct {
 	Stats            *StatsConfig            `json:"stats"`
 	Reverse          *ReverseConfig          `json:"reverse"`
 	FakeDNS          *FakeDNSConfig          `json:"fakeDns"`
-	Observatory      *ObservatoryConfig      `json:"observatory"`
-	BurstObservatory *BurstObservatoryConfig `json:"burstObservatory"`
+	Observatory      ObservatoryConfigs      `json:"observatory"`
+	BurstObservatory BurstObservatoryConfigs `json:"burstObservatory"`
 	Version          *VersionConfig          `json:"version"`
 	Geodata          *GeodataConfig          `json:"geodata"`
 }
@@ -621,18 +621,10 @@ func (c *Config) Build() (*core.Config, error) {
 		config.App = append([]*serial.TypedMessage{serial.ToTypedMessage(r)}, config.App...)
 	}
 
-	if c.Observatory != nil {
-		r, err := c.Observatory.Build()
+	if len(c.Observatory) != 0 || len(c.BurstObservatory) != 0 {
+		r, err := c.buildMultipleObservatoryConfig()
 		if err != nil {
 			return nil, errors.New("failed to build observatory configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
-	}
-
-	if c.BurstObservatory != nil {
-		r, err := c.BurstObservatory.Build()
-		if err != nil {
-			return nil, errors.New("failed to build burst observatory configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
