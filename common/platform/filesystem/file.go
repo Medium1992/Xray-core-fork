@@ -48,27 +48,44 @@ func StatAsset(file string) (os.FileInfo, error) {
 }
 
 func ResolveAsset(file string) (string, error) {
-	path, _, err := getAssetFileLocation(file)
-	return path, err
+	path, err := resolveAssetPath(file)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("asset is not a regular file")
+	}
+	return path, nil
 }
 
 func getAssetFileLocation(file string) (string, os.FileInfo, error) {
-	if !filepath.IsLocal(file) || file == "." {
-		return "", nil, errors.New("asset path must stay in asset directory")
-	}
-	local, err := filepath.Localize(file)
+	path, err := ResolveAsset(file)
 	if err != nil {
 		return "", nil, err
 	}
-	path := platform.GetAssetLocation(local)
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", nil, err
 	}
-	if !info.Mode().IsRegular() {
-		return "", nil, errors.New("asset is not a regular file")
-	}
 	return path, info, nil
+}
+
+func resolveAssetPath(file string) (string, error) {
+	if !filepath.IsLocal(file) || file == "." {
+		return "", errors.New("asset path must stay in asset directory")
+	}
+	local, err := filepath.Localize(file)
+	if err != nil {
+		return "", err
+	}
+	return platform.GetAssetLocation(local), nil
 }
 
 func ReadCert(file string) ([]byte, error) {

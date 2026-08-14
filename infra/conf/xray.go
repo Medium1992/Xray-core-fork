@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/xtls/xray-core/app/dispatcher"
+	appgeodata "github.com/xtls/xray-core/app/geodata"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/errors"
@@ -540,6 +541,18 @@ func (c *Config) Build() (*core.Config, error) {
 		return nil, errors.New("failed to post-process configuration file").Base(err)
 	}
 
+	var geodataConfig *appgeodata.Config
+	if c.Geodata != nil {
+		r, err := c.Geodata.Build()
+		if err != nil {
+			return nil, errors.New("failed to build geodata configuration").Base(err)
+		}
+		geodataConfig = r.(*appgeodata.Config)
+		if err := appgeodata.DownloadMissingAssets(context.Background(), geodataConfig.Assets); err != nil {
+			return nil, errors.New("failed to download missing geodata assets").Base(err)
+		}
+	}
+
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
@@ -645,12 +658,8 @@ func (c *Config) Build() (*core.Config, error) {
 		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
 
-	if c.Geodata != nil {
-		r, err := c.Geodata.Build()
-		if err != nil {
-			return nil, errors.New("failed to build geodata configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
+	if geodataConfig != nil {
+		config.App = append(config.App, serial.ToTypedMessage(geodataConfig))
 	}
 
 	var inbounds []InboundDetourConfig
