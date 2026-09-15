@@ -2,20 +2,24 @@ package mux
 
 import (
 	"context"
+	"crypto/rand"
 	"io"
 	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -102,6 +106,11 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.CanSpliceCopy = 3
+		if conn, ok := stat.TryUnwrapStatsConn(inbound.Conn).(muxKeepAliveConn); ok {
+			if _, to := conn.MuxKeepAlive(); to > 0 {
+				go worker.keepAlive(conn)
+			}
+		}
 	}
 	go worker.run(ctx)
 	go worker.monitor()
@@ -137,6 +146,68 @@ func (w *ServerWorker) monitor() {
 			}
 		}
 	}
+}
+
+// muxKeepAliveConn is implemented by transports whose downlink is an HTTP
+// response that middleboxes cut once it carries nothing for a while. It reports
+// how long, in seconds, its downlink may stay silent, how much padding to hide
+// in a poke, and how long it has been silent. Zero seconds leaves it alone.
+type muxKeepAliveConn interface {
+	MuxKeepAlive() (int32, int32)
+	MuxKeepAliveBytes() (int32, int32)
+	DownlinkIdle() time.Duration
+}
+
+func roll(from, to int32) int {
+	if to < from {
+		to = from
+	}
+	return int(from) + dice.Roll(int(to-from+1))
+}
+
+// keepAlive sends the KeepAlive frame every client already discards, so that a
+// downlink whose sessions are all quiet is not taken for idle on the way. It
+// only pokes a downlink that has actually fallen silent, and only a transport
+// that asks for it gets one, so others gain no pattern.
+func (w *ServerWorker) keepAlive(conn muxKeepAliveConn) {
+	from, to := conn.MuxKeepAlive()
+	if from < 1 {
+		from = 1
+	}
+	for {
+		wait := time.Duration(roll(from, to)) * time.Second
+		if idle := conn.DownlinkIdle(); idle < wait {
+			wait -= idle
+		} else if !w.writeKeepAlive(conn) {
+			return
+		}
+		select {
+		case <-w.done.Wait():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+func (w *ServerWorker) writeKeepAlive(conn muxKeepAliveConn) bool {
+	meta := FrameMetadata{SessionStatus: SessionStatusKeepAlive}
+	padding := 0
+	if from, to := conn.MuxKeepAliveBytes(); to > 0 {
+		if from < 0 {
+			from = 0
+		}
+		padding = roll(from, min(to, 1024))
+	}
+	if padding > 0 {
+		meta.Option.Set(OptionData)
+	}
+	b := buf.New()
+	common.Must(meta.WriteTo(b))
+	if padding > 0 {
+		common.Must2(serial.WriteUint16(b, uint16(padding)))
+		common.Must2(rand.Read(b.Extend(int32(padding))))
+	}
+	return w.link.Writer.WriteMultiBuffer(buf.MultiBuffer{b}) == nil
 }
 
 func (w *ServerWorker) ActiveConnections() uint32 {
