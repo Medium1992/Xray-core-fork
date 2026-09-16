@@ -1,0 +1,65 @@
+name: Slim Release
+
+# Собирает xray только под linux/amd64 и linux/arm64 и кладёт в релиз
+# распакованными бинарниками, без архивов и без geodat-ресурсов.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ветка, тег или SHA, который собирать"
+        required: true
+        default: feat/xhttp-mux-cool
+      tag:
+        description: "Тег релиза (будет создан, если его ещё нет)"
+        required: true
+      prerelease:
+        description: "Пометить релиз как pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: |
+          set -eux
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
+              go build -v -trimpath -ldflags "-s -w -buildid=" -o "xray-linux-$arch" ./main
+          done
+          sha256sum xray-linux-* | tee sha256sums.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -eu
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            ARGS=(--target "$(git rev-parse HEAD)" --title "$TAG")
+            if [ -f .github/RELEASE_NOTES.md ]; then
+              ARGS+=(--notes-file .github/RELEASE_NOTES.md)
+            else
+              ARGS+=(--generate-notes)
+            fi
+            if [ "$PRERELEASE" = "true" ]; then
+              ARGS+=(--prerelease)
+            fi
+            gh release create "$TAG" "${ARGS[@]}"
+          fi
+          gh release upload "$TAG" xray-linux-amd64 xray-linux-arm64 sha256sums.txt --clobber
