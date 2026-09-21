@@ -104,7 +104,7 @@ func readDefaultBufferSize() int32 {
 		case "arm64", "mips64", "mips64le":
 			return 4 * 1024 // 4k cache for low-end devices
 		default:
-			return 512 * 1024
+			return 64 * 1024 // lowered from 512k to cut per-connection memory on servers
 		}
 	default:
 		return int32(size) * 1024 * 1024
