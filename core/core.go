@@ -23,6 +23,8 @@ var (
 	Version_z byte = 9
 )
 
+const edition = "-mux-ka"
+
 var (
 	build    = "Custom"
 	codename = "Xray, Penetrates Everything."
@@ -66,7 +68,7 @@ func Version() string {
 // VersionStatement returns a list of strings representing the full version info.
 func VersionStatement() []string {
 	return []string{
-		serial.Concat("Xray ", Version(), " (", codename, ") ", build, " (", runtime.Version(), " ", runtime.GOOS, "/", runtime.GOARCH, ")"),
+		serial.Concat("Xray ", Version(), edition, " (", codename, ") ", build, " (", runtime.Version(), " ", runtime.GOOS, "/", runtime.GOARCH, ")"),
 		intro,
 	}
 }
