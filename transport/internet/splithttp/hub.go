@@ -565,8 +565,9 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			ReadHeaderTimeout: time.Second * 4,
 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
 			Protocols:         protocols,
+			HTTP2:             l.config.h2ReceiveConfig(true),
 		}
-		if flowEnabled {
+		if l.config.h2FlowOn() {
 			l.listener = &flowListener{Listener: l.listener, up: flowDefault, down: flowDefault}
 		}
 		go func() {
