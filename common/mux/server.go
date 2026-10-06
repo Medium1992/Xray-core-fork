@@ -207,6 +207,12 @@ func (w *ServerWorker) writeKeepAlive(conn muxKeepAliveConn) bool {
 		common.Must2(serial.WriteUint16(b, uint16(padding)))
 		common.Must2(rand.Read(b.Extend(int32(padding))))
 	}
+	// Look for Close as late as possible: a frame the loop has not started
+	// writing by the time the worker closes is never written.
+	if w.done.Done() {
+		b.Release()
+		return false
+	}
 	return w.link.Writer.WriteMultiBuffer(buf.MultiBuffer{b}) == nil
 }
 
