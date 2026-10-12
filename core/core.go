@@ -23,7 +23,11 @@ var (
 	Version_z byte = 10
 )
 
-const edition = "-mux-ka"
+// edition follows the version number in the version statement. A release
+// build sets it to the release it is, such as "-mux-ka-11", with
+// -ldflags "-X github.com/xtls/xray-core/core.edition=...", so that a node
+// shows which release it runs.
+var edition = "-mux-ka"
 
 var (
 	build    = "Custom"
