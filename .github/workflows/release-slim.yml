@@ -2,6 +2,21 @@ name: Slim Release
 
 # Собирает xray только под linux/amd64 и linux/arm64 и кладёт в релиз
 # распакованными бинарниками, без архивов и без geodat-ресурсов.
+#
+# Пониженные буферы для серверов/транзитов (см. XTLS/Xray-core#6268,
+# golang/go#79831):
+#   - пайпы диспетчера (512k -> 64k на пайп) правятся прямо в исходниках
+#     ветки, в features/policy/policy.go — это основной расход памяти;
+#   - скретч h2-аплоада (512k -> 32k на стрим) нужен, когда узел сам ходит
+#     XHTTP-клиентом к следующему хопу (транзиты). Под Go 1.27 http2.Transport
+#     из x/net оборачивает net/http, и рабочий буфер живёт в стандартной
+#     библиотеке; с http2legacy — в самом x/net. Патчатся оба, здесь в CI,
+#     чтобы ограничение действовало с любым из транспортов.
+#
+# BUILD_TAGS=http2legacy возвращает собственный пул соединений x/net: под
+# Go 1.27 без него каждый запрос, ждущий зависший TLS-хендшейк, открывает свой
+# TCP, и xmux.maxConnections перестаёт ограничивать сокеты
+# (XTLS/Xray-core#6797). Убрать, когда это починят в Xray или Go.
 
 on:
   workflow_dispatch:
@@ -24,6 +39,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+      BUILD_TAGS: http2legacy
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,12 +52,45 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
+      - name: Lower h2 uplink scratch buffer
         run: |
           set -eux
+          patch_scratch() {
+            grep -Fq 'const max = 512 << 10' "$1" \
+              || { echo "frameScratchBufferLen changed shape in $1" >&2; exit 1; }
+            chmod u+w "$1"
+            sed -i 's/const max = 512 << 10/const max = 32 << 10/' "$1"
+            grep -Fq 'const max = 32 << 10' "$1" \
+              || { echo "h2 scratch patch did not apply to $1" >&2; exit 1; }
+          }
+          patch_scratch "$(go env GOROOT)/src/net/http/internal/http2/transport.go"
+          go mod vendor
+          patch_scratch vendor/golang.org/x/net/http2/transport.go
+          files=" $(go list -mod=vendor -tags "$BUILD_TAGS" -f '{{join .GoFiles " "}}' golang.org/x/net/http2) "
+          case ",$BUILD_TAGS," in
+            *,http2legacy,*)
+              case "$files" in
+                *" transport.go "*) ;;
+                *) echo "http2legacy no longer selects x/net's own transport" >&2; exit 1 ;;
+              esac ;;
+          esac
+
+      - name: Build
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eux
+          go version
+          # Тег v26.10.10-mux-ka-11 даёт версию 26.10.10-mux-ka-11.
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-mux-ka-[0-9]*) EDITION="-${TAG#*-}" ;;
+            *) echo "Тег '$TAG' не вида vX.Y.Z-mux-ka-N" >&2; exit 1 ;;
+          esac
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
-              go build -v -trimpath -ldflags "-s -w -buildid=" -o "xray-linux-$arch" ./main
+              go build -mod=vendor -tags "$BUILD_TAGS" -v -trimpath \
+                -ldflags "-s -w -buildid= -X github.com/xtls/xray-core/core.edition=$EDITION" \
+                -o "xray-linux-$arch" ./main
           done
           sha256sum xray-linux-* | tee sha256sums.txt
 
