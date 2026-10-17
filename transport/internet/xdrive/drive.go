@@ -26,7 +26,8 @@ const (
 	driveMaxAttempts = 8
 	driveMaxInflight = 32
 	driveInlineLimit = 12000
-	driveTimeout     = 60 * time.Second
+	// driveTimeout ends a request that makes no progress for that long
+	driveTimeout = 60 * time.Second
 )
 
 var (
@@ -153,7 +154,7 @@ func jitter(backoff time.Duration) time.Duration {
 	if half <= 0 {
 		return backoff
 	}
-	return half + time.Duration(dice.Roll(int(half)))
+	return half + time.Duration(dice.RollInt63n(int64(half)))
 }
 
 func rateLimited(payload []byte) bool {
