@@ -1,6 +1,7 @@
 package splithttp
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -8,19 +9,34 @@ import (
 )
 
 // queuedPath makes c take the kernel's word for an empty path of minRTT and
-// a round trip of rtt now, until the test changes it.
+// a round trip of rtt now, until the test changes it, on a path of its own
+// unless it has one.
 func queuedPath(c *flowConn, minRTT, rtt time.Duration) {
 	c.tcp, c.kAt, c.kOK = fakeRawConn{}, time.Now().Add(time.Hour), true
 	c.kstat = tcpStats{rtt: rtt, minRTT: minRTT}
 	c.rttBase = minRTT
 	if c.path == nil {
-		c.path, c.pathSet = &flowPath{}, true
+		c.path, c.pathSet = &flowPath{inFlight: map[*flowConn][2]int64{}}, true
 	}
+}
+
+// inFlight sets what c's open downloads have in flight and what c has in
+// the network, as its kernel reports it, to n each.
+func inFlight(c *flowConn, n int64) {
+	c.downOpenSent, c.downOpenReturned = 1<<30+n, 1<<30
+	c.kstat.unacked = n
+}
+
+// judged reads c's path at at and flowSuspectRounds round trips later, as
+// a verdict asks, and gives the second answer.
+func judged(c *flowConn, at time.Time) bool {
+	c.foreignQueue(at)
+	return c.foreignQueue(at.Add(flowSuspectRounds * c.kstat.rtt))
 }
 
 // queuedDownload is a server with one download whose reader takes all it is
 // sent, on a path whose round trip stands at 500 ms over an empty 50 ms: a
-// queue the server must cut against. The cap is 1 MiB.
+// queue the server cuts against while it counts as its own. The cap is 1 MiB.
 func queuedDownload(t *testing.T) (h *flowHarness, s *flowStream) {
 	t.Helper()
 	const id = 1
@@ -46,125 +62,217 @@ func credit(h *flowHarness, s *flowStream) int32 {
 	return s.down.cap
 }
 
-// probeRan moves the open probe and the stream's last cut flowProbeRounds
-// round trips and more into the past, and sets the round trip the kernel
-// reports then.
-func probeRan(t *testing.T, h *flowHarness, s *flowStream, rtt time.Duration) {
-	t.Helper()
-	h.c.mu.Lock()
-	defer h.c.mu.Unlock()
-	if h.c.path.probeAt.IsZero() {
-		t.Fatal("a standing queue opened no probe")
-	}
-	back := (flowProbeRounds + 1) * h.c.path.probeRTT
-	h.c.path.probeAt = h.c.path.probeAt.Add(-back)
-	s.down.qAt = s.down.qAt.Add(-back)
-	h.c.kstat.rtt = rtt
-}
-
-// TestFlowForeignQueueStopsCuts is a queue the server's cut does not
-// shorten: the round trip stands where it was. Other traffic keeps it full,
-// and cutting further would hand that traffic the path down to init per
-// round trip. After the probe the queue counts as foreign: the cap is cut no
-// more, and it still is not some round trips later.
-func TestFlowForeignQueueStopsCuts(t *testing.T) {
-	h, s := queuedDownload(t)
-	first := credit(h, s)
-	if first >= 1<<20 {
-		t.Fatalf("against a standing queue the cap stayed at %d, want the probe's cut", first)
-	}
-	probeRan(t, h, s, 500*time.Millisecond)
-	cut := credit(h, s)
-	if cut < first {
-		t.Fatalf("the cap was cut again to %d by a queue the last cut did not shorten", cut)
-	}
-	h.c.mu.Lock()
-	foreign, open := h.c.path.foreignUntil.After(time.Now()), !h.c.path.probeAt.IsZero()
-	s.down.qAt = s.down.qAt.Add(-time.Second)
-	h.c.mu.Unlock()
-	if !foreign || open {
-		t.Fatalf("after the probe: foreign %v, a probe still open %v; want the queue foreign and the probe settled", foreign, open)
-	}
-	if got := credit(h, s); got < cut {
-		t.Fatalf("the cap was cut to %d while the queue counts as foreign", got)
-	}
-}
-
-// TestFlowOwnQueueKeepsCuts is a queue the cut did shorten: the round trip
-// came down from 500 to 400 ms, a fifth of the queue. It is the server's
-// own, and the next round trip is cut as before.
-func TestFlowOwnQueueKeepsCuts(t *testing.T) {
-	h, s := queuedDownload(t)
-	first := credit(h, s)
-	probeRan(t, h, s, 400*time.Millisecond)
-	if got := credit(h, s); got >= first {
-		t.Fatalf("the cap stayed at %d after a cut that shortened the queue, want it cut again", got)
-	}
-	h.c.mu.Lock()
-	defer h.c.mu.Unlock()
-	if h.c.path.foreignUntil.After(time.Now()) {
-		t.Fatal("a queue the cut shortened counts as foreign")
-	}
-}
-
-// TestFlowSmallQueueOpensNoProbe is a queue at twice the setpoint's level:
-// pi keeps such a queue, and no probe cuts against it. Just above, one does.
-func TestFlowSmallQueueOpensNoProbe(t *testing.T) {
+// TestFlowQueueThatStaysIsForeign is a queue of 450 ms over an empty 50 ms
+// that stays where it was while what the server has in flight comes down
+// from 4 to 2 MiB: no queue of the server's own does, so it counts as
+// foreign. At 2.1 MiB it does not yet.
+func TestFlowQueueThatStaysIsForeign(t *testing.T) {
 	c := &flowConn{streams: map[uint32]*flowStream{}}
-	queuedPath(c, 50*time.Millisecond, 50*time.Millisecond+2*queueSetpoint(tcpStats{minRTT: 50 * time.Millisecond}))
-	c.probeQueue(time.Now())
-	if !c.path.probeAt.IsZero() {
-		t.Fatal("a queue of twice the setpoint opened a probe")
+	queuedPath(c, 50*time.Millisecond, 500*time.Millisecond)
+	now := time.Now()
+	inFlight(c, 4<<20)
+	c.foreignQueue(now)
+	inFlight(c, 2100<<10)
+	if judged(c, now.Add(time.Second)) {
+		t.Fatal("foreign before what was in flight came down to half")
 	}
-	c.kstat.rtt += time.Millisecond
-	c.probeQueue(time.Now())
-	if c.path.probeAt.IsZero() {
-		t.Fatal("a queue over twice the setpoint opened no probe")
+	inFlight(c, 2<<20)
+	for _, d := range []time.Duration{0, time.Millisecond, flowSuspectRounds*c.kstat.rtt - time.Millisecond} {
+		if c.foreignQueue(now.Add(3*time.Second + d)) {
+			t.Fatalf("foreign %v after the halving, before the smoothed round trip could follow the queue", d)
+		}
+	}
+	if !c.foreignQueue(now.Add(3*time.Second + flowSuspectRounds*c.kstat.rtt)) {
+		t.Fatal("a queue that stayed while the server's own data halved is not foreign")
 	}
 }
 
-// TestFlowProbeCutsEveryDownload is a probe on a connection with three open
-// downloads and one the server has finished. All three open ones are cut at
-// once to a quarter under what they have in flight, never under init: a cut
-// of one stream in eight, or of a cap a stream does not fill, would move the
-// queue too little to tell whose it is.
-func TestFlowProbeCutsEveryDownload(t *testing.T) {
-	c := &flowConn{streams: map[uint32]*flowStream{}, down: flowDefault}
+// TestFlowQueueThatShortensIsOwn is the server's own queue: when what it has
+// in flight halves, the queue comes down from 450 to 300 ms, by a third, and
+// it never counts as foreign.
+func TestFlowQueueThatShortensIsOwn(t *testing.T) {
+	c := &flowConn{streams: map[uint32]*flowStream{}}
 	queuedPath(c, 50*time.Millisecond, 500*time.Millisecond)
-	for id, st := range map[uint32][2]int32{1: {1 << 20, 1 << 20}, 3: {1 << 20, 400 << 10}, 5: {h2InitWindow, h2InitWindow}} {
-		c.streams[id] = &flowStream{down: flowWindow{cap: st[0], returned: 1 << 30}, downSent: 1<<30 + int64(st[1])}
+	now := time.Now()
+	inFlight(c, 4<<20)
+	c.foreignQueue(now)
+	inFlight(c, 2<<20)
+	c.kstat.rtt = 350 * time.Millisecond
+	if judged(c, now.Add(time.Second)) {
+		t.Fatal("a queue that came down by a third with the server's data counts as foreign")
 	}
-	c.streams[7] = &flowStream{down: flowWindow{cap: 1 << 20}, serverDone: true}
-	c.probeQueue(time.Now())
-	for id, want := range map[uint32]int32{1: 768 << 10, 3: 300 << 10, 5: h2InitWindow, 7: 1 << 20} {
-		if got := c.streams[id].down.cap; got != want {
-			t.Errorf("stream %d: cap %d after the probe, want %d", id, got, want)
+}
+
+// TestFlowForeignQueueEnds is a foreign queue that drains, and one that does
+// not: the first counts as the server's own at once, the second after
+// flowForeignRounds round trips, when the server cuts against it again.
+func TestFlowForeignQueueEnds(t *testing.T) {
+	for _, drains := range []bool{true, false} {
+		c := &flowConn{streams: map[uint32]*flowStream{}}
+		queuedPath(c, 50*time.Millisecond, 500*time.Millisecond)
+		now := time.Now()
+		inFlight(c, 4<<20)
+		c.foreignQueue(now)
+		inFlight(c, 1<<20)
+		if !judged(c, now.Add(time.Second)) {
+			t.Fatalf("drains %v: not foreign", drains)
+		}
+		now = now.Add(flowSuspectRounds * c.kstat.rtt)
+		later := now.Add(2 * time.Second)
+		if drains {
+			c.kstat.rtt = 60 * time.Millisecond
+			if c.foreignQueue(later) {
+				later = later.Add(flowSuspectRounds * c.kstat.rtt)
+			} else {
+				t.Fatal("a queue that dipped under the bar for a moment ended the verdict")
+			}
+		} else {
+			later = now.Add(time.Second + flowForeignRounds*500*time.Millisecond)
+			if !c.foreignQueue(later.Add(-time.Millisecond)) {
+				t.Fatal("no longer foreign before flowForeignRounds round trips")
+			}
+		}
+		if c.foreignQueue(later) {
+			t.Fatalf("drains %v: still foreign", drains)
 		}
 	}
 }
 
-// TestFlowProbeSpansConnections is a probe one connection from a client
-// opens: another from the same client cuts its downloads for it when it next
-// hears from the client, and only once, for its queue is mostly the first
-// one's data and the other way round.
-func TestFlowProbeSpansConnections(t *testing.T) {
-	path := &flowPath{}
-	conns := [2]*flowConn{}
-	for i := range conns {
-		c := &flowConn{streams: map[uint32]*flowStream{}, down: flowDefault, path: path, pathSet: true}
-		queuedPath(c, 50*time.Millisecond, 500*time.Millisecond)
-		c.streams[1] = &flowStream{down: flowWindow{cap: 1 << 20}, downSent: 1 << 20}
-		conns[i] = c
-	}
+// TestFlowInFlightSpansConnections is a client with two connections, 2 MiB
+// in flight on each, behind a standing queue. When one of them is down to
+// 1 MiB the path holds 3 MiB, three quarters, and that says nothing; when
+// the other is down to 0.9 MiB as well, the path holds under half, and the
+// queue is foreign. A connection alone would have taken its own halving for
+// the verdict, with the other's data the queue.
+func TestFlowInFlightSpansConnections(t *testing.T) {
+	path := &flowPath{inFlight: map[*flowConn][2]int64{}}
+	a := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+	b := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+	queuedPath(a, 50*time.Millisecond, 500*time.Millisecond)
+	queuedPath(b, 50*time.Millisecond, 500*time.Millisecond)
 	now := time.Now()
-	conns[0].probeQueue(now)
-	conns[1].kstat.rtt = 60 * time.Millisecond
-	conns[1].probeQueue(now.Add(time.Millisecond))
-	if got := conns[1].streams[1].down.cap; got != 768<<10 {
-		t.Fatalf("the other connection's download has cap %d after the probe, want 768 KiB", got)
+	inFlight(a, 2<<20)
+	inFlight(b, 2<<20)
+	a.foreignQueue(now)
+	b.foreignQueue(now)
+	inFlight(a, 1<<20)
+	if judged(a, now.Add(time.Second)) {
+		t.Fatal("one connection's halving counted for the path's")
 	}
-	conns[1].probeQueue(now.Add(2 * time.Millisecond))
-	if got := conns[1].streams[1].down.cap; got != 768<<10 {
-		t.Fatalf("the other connection cut again to %d for the same probe", got)
+	inFlight(b, 900<<10)
+	if !judged(b, now.Add(3*time.Second)) {
+		t.Fatal("the path's data halved with the queue where it was, and it is not foreign")
+	}
+	path.release(a)
+	if _, ok := path.inFlight[a]; ok {
+		t.Fatal("a released connection still counts for the path")
+	}
+}
+
+// TestFlowPathFloor is a connection opened into a standing queue: its kernel
+// takes 450 ms for the empty path, and to it the queue looks small. The
+// path keeps the least empty-path round trip of all its connections, 50 ms,
+// and the queue counts as foreign all the same.
+func TestFlowPathFloor(t *testing.T) {
+	path := &flowPath{inFlight: map[*flowConn][2]int64{}}
+	early := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+	queuedPath(early, 50*time.Millisecond, 60*time.Millisecond)
+	now := time.Now()
+	early.foreignQueue(now)
+	path.release(early)
+	late := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+	queuedPath(late, 450*time.Millisecond, 500*time.Millisecond)
+	inFlight(late, 4<<20)
+	late.foreignQueue(now.Add(time.Second))
+	inFlight(late, 1<<20)
+	if !judged(late, now.Add(2*time.Second)) {
+		t.Fatal("a queue over the path's floor did not count as foreign for a connection with a higher one")
+	}
+}
+
+// tcpPeer is a connection whose peer is a TCP address.
+type tcpPeer struct {
+	net.Conn
+	addr *net.TCPAddr
+}
+
+func (c tcpPeer) RemoteAddr() net.Addr { return c.addr }
+
+// TestFlowPathOutlivesConnections is a client that closes its connection and
+// opens another: the new one gets the same path, with what it learnt, and a
+// client from another address does not.
+func TestFlowPathOutlivesConnections(t *testing.T) {
+	c := &flowConn{}
+	a := tcpPeer{addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 7), Port: 40000}}
+	p := flowPathOf(a)
+	p.release(c)
+	a.addr = &net.TCPAddr{IP: net.IPv4(192, 0, 2, 7), Port: 40001}
+	q := flowPathOf(a)
+	defer q.release(c)
+	if q != p {
+		t.Fatal("a new connection from the same address got a new path")
+	}
+	b := flowPathOf(tcpPeer{addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 8), Port: 40000}})
+	defer b.release(c)
+	if b == p {
+		t.Fatal("a connection from another address got the same path")
+	}
+}
+
+// TestFlowForeignQueueStopsCuts is a download against a standing queue: the
+// cap is cut while the queue counts as the server's own, and not while it
+// counts as foreign.
+func TestFlowForeignQueueStopsCuts(t *testing.T) {
+	for _, foreign := range []bool{false, true} {
+		h, s := queuedDownload(t)
+		if foreign {
+			h.c.mu.Lock()
+			h.c.path.foreignAt = time.Now()
+			h.c.mu.Unlock()
+		}
+		got := credit(h, s)
+		if cut := got < 1<<20; cut == foreign {
+			t.Fatalf("foreign %v: the cap went from 1 MiB to %d", foreign, got)
+		}
+	}
+}
+
+// TestFlowBothMustHalve is a queue that stands while only one of the two
+// halves: what the downloads have in flight, as a client drains its buffers
+// with the server's own data still filling the network, or what the
+// network holds, with the downloads' credit where it was. Neither says the
+// queue is foreign; both together do.
+func TestFlowBothMustHalve(t *testing.T) {
+	for _, half := range []string{"downloads", "network", "both"} {
+		c := &flowConn{streams: map[uint32]*flowStream{}}
+		queuedPath(c, 50*time.Millisecond, 500*time.Millisecond)
+		now := time.Now()
+		inFlight(c, 4<<20)
+		c.foreignQueue(now)
+		if half != "network" {
+			c.downOpenSent = c.downOpenReturned + 1<<20
+		}
+		if half != "downloads" {
+			c.kstat.unacked = 1 << 20
+		}
+		if got := judged(c, now.Add(time.Second)); got != (half == "both") {
+			t.Fatalf("%s halved: foreign %v", half, got)
+		}
+	}
+}
+
+// TestFlowBarLeavesJitterOut is a foreign queue of 600 ms on a path whose
+// round trip swings by 300 ms with it: pi's setpoint, four times that swing,
+// would take the queue for none and end the verdict at once.
+func TestFlowBarLeavesJitterOut(t *testing.T) {
+	c := &flowConn{streams: map[uint32]*flowStream{}}
+	queuedPath(c, 150*time.Millisecond, 750*time.Millisecond)
+	c.kstat.rttVar = 300 * time.Millisecond
+	now := time.Now()
+	inFlight(c, 4<<20)
+	c.foreignQueue(now)
+	inFlight(c, 1<<20)
+	if !judged(c, now.Add(time.Second)) {
+		t.Fatal("a queue of 600 ms that swings by 300 ms is not foreign")
 	}
 }

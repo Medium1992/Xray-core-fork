@@ -166,6 +166,9 @@ func initialWindow(payload []byte) (real int32, found bool) {
 
 type tcpStats struct {
 	rtt, minRTT, rttVar time.Duration
+	// unacked is what the connection has sent and not had acknowledged:
+	// what it has in the network, on the wire and in the queue.
+	unacked int64
 }
 
 type flowListener struct {
@@ -678,13 +681,11 @@ type flowConn struct {
 	kOK   bool
 
 	// path is what this server's connections from the same client share
-	// of a probe, see foreignQueue, looked up once it is first needed:
+	// of the queue, see foreignQueue, looked up once it is first needed:
 	// asking a connection behind a PROXY header for its peer waits for that
-	// header. probeCut is the probe this connection last cut its downloads
-	// for.
-	path     *flowPath
-	pathSet  bool
-	probeCut time.Time
+	// header.
+	path    *flowPath
+	pathSet bool
 }
 
 // queueing tells how far the kernel RTT of this TCP connection has climbed
@@ -707,76 +708,114 @@ func (c *flowConn) queueing(now time.Time) int {
 }
 
 // A server cuts download caps against the queue the kernel sees, so that its
-// own data does not stand in front of other streams. A queue that other
-// traffic keeps full, on a link shared in the evening, does not shorten when
-// it does: cut after cut only hands that traffic the path, down to init per
-// round trip. So while a queue stands at more than twice the setpoint, the
-// server probes: it cuts every open download at once, to a quarter under
-// what it has in flight; a cap it does not fill would be cut for nothing.
-// If within flowProbeRounds round trips the round trip never came down by an
-// eighth of that queue, the queue counts as foreign for flowForeignRounds
-// round trips: caps then follow their readers alone, as without a queue,
-// and a queue that still stands after that is probed again. A smaller queue
-// opens no probe: pi keeps one at the setpoint, and a cut moves it too
-// little to tell whose it is.
+// own data does not stand in front of other streams. pi does so gradually,
+// to hold the queue near its setpoint without jumping on jitter. A queue
+// that other traffic keeps full, on a link shared in the evening, does not
+// shorten when the server cuts: cut after cut only hands that traffic the
+// path, down to init per round trip, as little as a megabit per second where
+// that traffic stands for a second in the queue.
+//
+// The server's own queue is made of what it has in the network, so it
+// shortens when that does. So once a queue stands at twice a quarter of the
+// empty path's round trip, the server watches two things: what its
+// downloads to the client have in flight, which the cuts move, and what its
+// connections to the client have sent and not had acknowledged, as the
+// kernel counts it, which is what stands in the network. When both have
+// come down to half of the most they were, and the queue has not come down
+// by a quarter for flowSuspectRounds round trips, the queue is foreign; the
+// wait is for the kernel's round trip, which is smoothed and follows the
+// queue some way behind. The first alone halves as a reader catches up,
+// much of it waiting in buffers at either end; the second alone is small
+// whenever other traffic takes most of the path, cut or not.
+//
+// A foreign queue's downloads are neither cut nor held against it, and their
+// caps follow their readers as without a governor, so they keep the share a
+// server without one would. The queue counts as the server's own again once
+// it has stood drained under the bar for flowSuspectRounds round trips, and
+// after flowForeignRounds round trips, when the server cuts against it again
+// to see.
 //
 // A client's connections to the server share its bottleneck, and the queue
-// one of them sees is mostly the others' data: a probe of one would take it
-// for foreign. So a probe is one for all connections from the client's
-// address, a flowPath: each cuts its downloads once it next hears from the
-// client, and any of them settles it.
+// one of them sees is mostly the others' data; within a connection, so is
+// the queue one stream sees. So the queue is judged for all downloads to the
+// client's address at once, a flowPath, against the least round trip any of
+// its connections has had: a connection opened into a standing queue takes
+// that queue for its empty path. The path keeps its state for flowPathKeep
+// after its last connection closes, as a client opens new ones, and takes a
+// new floor as often, as the kernel does.
 const (
-	flowProbeRounds   = 4
-	flowForeignRounds = 16
+	flowSuspectRounds = 2
+	flowForeignRounds = 32
+	flowPathKeep      = 5 * time.Minute
 )
 
-// flowPath is the probe state a server's connections from one address
+// flowPath is the queue state a server's connections from one address
 // share. Its lock is taken under a connection's, never the other way.
 type flowPath struct {
-	key  string
-	refs int
+	key    string
+	refs   int
+	idleAt time.Time
 
 	mu sync.Mutex
-	// probeAt is when the running probe opened, probeRTT and probeMin the
-	// round trip and the empty path's then, probeLow the lowest round trip
-	// any connection has read since; foreignUntil is how long the queue
-	// counts as other traffic's.
-	probeAt      time.Time
-	probeRTT     time.Duration
-	probeMin     time.Duration
-	probeLow     time.Duration
-	foreignUntil time.Time
+	// floor is the least empty-path round trip of the path's connections
+	// since floorAt. inFlight is what each connection's open downloads have
+	// in flight and what it has in the network. cutQ is the queue when it
+	// first stood over the bar, zero while it does not, and cutIn the most
+	// of each since; suspectAt is when both halved with the queue where it
+	// was, zero while not. foreignAt is when
+	// the queue began to count as foreign, zero while it counts as the
+	// server's own.
+	floor     time.Duration
+	floorAt   time.Time
+	inFlight  map[*flowConn][2]int64
+	cutQ      time.Duration
+	cutIn     [2]int64
+	suspectAt time.Time
+	foreignAt time.Time
 }
 
 var (
-	flowPathsMu sync.Mutex
-	flowPaths   = map[string]*flowPath{}
+	flowPathsMu    sync.Mutex
+	flowPaths      = map[string]*flowPath{}
+	flowPathsSwept time.Time
 )
 
-// flowPathOf returns the probe state shared by connections from c's peer
+// flowPathOf returns the queue state shared by connections from c's peer
 // address, taking a reference, or nil where c has none.
 func flowPathOf(c net.Conn) *flowPath {
 	addr, ok := c.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		return nil
 	}
-	key := addr.IP.String()
+	key, now := addr.IP.String(), time.Now()
 	flowPathsMu.Lock()
 	defer flowPathsMu.Unlock()
+	if now.Sub(flowPathsSwept) >= flowPathKeep {
+		flowPathsSwept = now
+		for k, p := range flowPaths {
+			if p.refs == 0 && now.Sub(p.idleAt) >= flowPathKeep {
+				delete(flowPaths, k)
+			}
+		}
+	}
 	p := flowPaths[key]
 	if p == nil {
-		p = &flowPath{key: key}
+		p = &flowPath{key: key, inFlight: map[*flowConn][2]int64{}}
 		flowPaths[key] = p
 	}
 	p.refs++
 	return p
 }
 
-func (p *flowPath) release() {
+// release drops c's reference to p and what it had in flight.
+func (p *flowPath) release(c *flowConn) {
+	p.mu.Lock()
+	delete(p.inFlight, c)
+	p.mu.Unlock()
 	flowPathsMu.Lock()
 	defer flowPathsMu.Unlock()
 	if p.refs--; p.refs == 0 {
-		delete(flowPaths, p.key)
+		p.idleAt = time.Now()
 	}
 }
 
@@ -789,8 +828,9 @@ func (c *flowConn) sharedPath() *flowPath {
 	return c.path
 }
 
-// foreignQueue settles a probe that has run its course and reports whether
-// the queue counts as foreign now.
+// foreignQueue adds what c's downloads have in flight and the queue the
+// kernel reads now to its path's state, and reports whether the queue counts
+// as foreign now.
 func (c *flowConn) foreignQueue(now time.Time) bool {
 	if !c.kernelStats(now) {
 		return false
@@ -801,57 +841,53 @@ func (c *flowConn) foreignQueue(now time.Time) bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if now.Before(p.foreignUntil) {
-		return true
+	if p.floorAt.IsZero() || now.Sub(p.floorAt) >= flowPathKeep {
+		p.floor, p.floorAt = c.kstat.minRTT, now
 	}
-	if p.probeAt.IsZero() {
-		return false
+	p.floor = min(p.floor, c.kstat.minRTT)
+	st := c.kstat
+	st.minRTT = p.floor
+	// The bar leaves the jitter out, unlike pi's setpoint: a queue that
+	// other traffic keeps full swings the round trip by as much as it holds.
+	queue, bar := st.rtt-st.minRTT, 2*max(st.minRTT/4, flowPIMinSet)
+	if p.inFlight == nil {
+		p.inFlight = map[*flowConn][2]int64{}
 	}
-	// What was cut leaves the queue only as the data already sent drains,
-	// and the kernel's round trip is smoothed: the lowest it reads during
-	// the probe is what tells.
-	p.probeLow = min(p.probeLow, c.kstat.rtt)
-	if now.Sub(p.probeAt) < flowProbeRounds*p.probeRTT {
-		return false
+	p.inFlight[c] = [2]int64{max(0, c.downOpenSent-c.downOpenReturned), c.kstat.unacked}
+	var in [2]int64
+	for _, n := range p.inFlight {
+		in[0], in[1] = in[0]+n[0], in[1]+n[1]
 	}
-	queue := p.probeRTT - p.probeMin
-	foreign := p.probeLow > p.probeRTT-queue/8
-	p.probeAt = time.Time{}
-	if foreign {
-		p.foreignUntil = now.Add(flowForeignRounds * c.kstat.rtt)
-	}
-	return foreign
-}
-
-// probeQueue opens a probe if none runs and a queue stands at more than
-// twice the setpoint, and cuts the connection's open downloads for a probe
-// it has not cut them for yet: to a quarter under what each has in flight,
-// never under init.
-func (c *flowConn) probeQueue(now time.Time) {
-	if !c.kernelStats(now) {
-		return
-	}
-	p := c.sharedPath()
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	if p.probeAt.IsZero() && c.kstat.rtt-c.kstat.minRTT > 2*queueSetpoint(c.kstat) {
-		p.probeAt, p.probeRTT, p.probeMin, p.probeLow = now, c.kstat.rtt, c.kstat.minRTT, c.kstat.rtt
-	}
-	at := p.probeAt
-	p.mu.Unlock()
-	if at.IsZero() || at.Equal(c.probeCut) {
-		return
-	}
-	c.probeCut = at
-	for _, s := range c.streams {
-		if !s.serverDone {
-			inflight := int32(min(int64(s.down.cap), max(0, s.downSent-s.down.returned)))
-			s.down.cap = max(c.down.init, inflight/4*3)
-			s.down.qAt = now
+	switch {
+	case !p.foreignAt.IsZero():
+		// As a verdict waits for the smoothed round trip, so does its end:
+		// other traffic in a sawtooth lets its queue dip for a moment.
+		switch {
+		case now.Sub(p.foreignAt) >= flowForeignRounds*st.rtt:
+			p.foreignAt, p.suspectAt = time.Time{}, time.Time{}
+		case queue > bar:
+			p.suspectAt = time.Time{}
+		case p.suspectAt.IsZero():
+			p.suspectAt = now
+		case now.Sub(p.suspectAt) >= flowSuspectRounds*st.rtt:
+			p.foreignAt, p.suspectAt = time.Time{}, time.Time{}
+		}
+	case queue <= bar:
+		p.cutQ = 0
+	case p.cutQ == 0:
+		p.cutQ, p.cutIn, p.suspectAt = queue, in, time.Time{}
+	default:
+		p.cutIn = [2]int64{max(p.cutIn[0], in[0]), max(p.cutIn[1], in[1])}
+		switch {
+		case in[0] > p.cutIn[0]/2 || in[1] > p.cutIn[1]/2 || queue <= p.cutQ*3/4:
+			p.suspectAt = time.Time{}
+		case p.suspectAt.IsZero():
+			p.suspectAt = now
+		case now.Sub(p.suspectAt) >= flowSuspectRounds*st.rtt:
+			p.foreignAt, p.cutQ, p.suspectAt = now, 0, time.Time{}
 		}
 	}
+	return !p.foreignAt.IsZero()
 }
 
 // kernelStats refreshes the kernel's view of this TCP connection and reports
@@ -941,7 +977,8 @@ func (c *flowConn) queueShrink(w *flowWindow, now time.Time, init int32) {
 }
 
 // NetConn returns the accepted connection, so that code which looks through
-// connection wrappers still finds it behind the governor.
+// connection wrappers, for the client's physical address or a PROXY header,
+// still finds it behind the governor.
 func (c *flowConn) NetConn() net.Conn {
 	return c.Conn
 }
@@ -1039,7 +1076,7 @@ func (c *flowConn) releaseLocked() {
 	clear(c.wcredit)
 	c.closed = true
 	if c.path != nil {
-		c.path.release()
+		c.path.release(c)
 		c.path = nil
 	}
 	c.pathSet = true
@@ -1743,8 +1780,6 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
 		foreign := !c.client && c.foreignQueue(now)
 		if foreign {
 			q = 0
-		} else if !c.client {
-			c.probeQueue(now)
 		}
 		switch {
 		case c.client && c.modelled(now) && s.down.settled():
