@@ -304,7 +304,7 @@ func TestFlowPathTakesLongestQueue(t *testing.T) {
 	// queue going stale can end the verdict.
 	late := verdict.Add(flowPathFresh*55*time.Millisecond + time.Millisecond)
 	b.foreignQueue(late)
-	if b.foreignQueue(late.Add(flowSuspectRounds*55*time.Millisecond)) {
+	if b.foreignQueue(late.Add(flowSuspectRounds * 55 * time.Millisecond)) {
 		t.Fatal("a queue no connection has reported for long still holds the verdict")
 	}
 }
