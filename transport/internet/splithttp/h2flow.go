@@ -744,6 +744,7 @@ func (c *flowConn) queueing(now time.Time) int {
 // after its last connection closes, as a client opens new ones, and takes a
 // new floor as often, as the kernel does.
 const (
+	flowPathFresh     = 4
 	flowSuspectRounds = 2
 	flowForeignRounds = 32
 	flowPathKeep      = 5 * time.Minute
@@ -758,8 +759,7 @@ type flowPath struct {
 
 	mu sync.Mutex
 	// floor is the least empty-path round trip of the path's connections
-	// since floorAt. inFlight is what each connection's open downloads have
-	// in flight and what it has in the network. cutQ is the queue when it
+	// since floorAt. conns is what each connection reported last. cutQ is the queue when it
 	// first stood over the bar, zero while it does not, and cutIn the most
 	// of each since; suspectAt is when both halved with the queue where it
 	// was, zero while not. foreignAt is when
@@ -767,11 +767,20 @@ type flowPath struct {
 	// server's own.
 	floor     time.Duration
 	floorAt   time.Time
-	inFlight  map[*flowConn][2]int64
+	conns     map[*flowConn]flowPathConn
 	cutQ      time.Duration
 	cutIn     [2]int64
 	suspectAt time.Time
 	foreignAt time.Time
+}
+
+// flowPathConn is what a connection last told its path: what its open
+// downloads have in flight, what it has in the network, the queue it saw
+// and when.
+type flowPathConn struct {
+	inFlight, inNet int64
+	queue           time.Duration
+	at              time.Time
 }
 
 var (
@@ -800,7 +809,7 @@ func flowPathOf(c net.Conn) *flowPath {
 	}
 	p := flowPaths[key]
 	if p == nil {
-		p = &flowPath{key: key, inFlight: map[*flowConn][2]int64{}}
+		p = &flowPath{key: key, conns: map[*flowConn]flowPathConn{}}
 		flowPaths[key] = p
 	}
 	p.refs++
@@ -810,7 +819,7 @@ func flowPathOf(c net.Conn) *flowPath {
 // release drops c's reference to p and what it had in flight.
 func (p *flowPath) release(c *flowConn) {
 	p.mu.Lock()
-	delete(p.inFlight, c)
+	delete(p.conns, c)
 	p.mu.Unlock()
 	flowPathsMu.Lock()
 	defer flowPathsMu.Unlock()
@@ -849,14 +858,21 @@ func (c *flowConn) foreignQueue(now time.Time) bool {
 	st.minRTT = p.floor
 	// The bar leaves the jitter out, unlike pi's setpoint: a queue that
 	// other traffic keeps full swings the round trip by as much as it holds.
-	queue, bar := st.rtt-st.minRTT, 2*max(st.minRTT/4, flowPIMinSet)
-	if p.inFlight == nil {
-		p.inFlight = map[*flowConn][2]int64{}
+	bar := 2 * max(st.minRTT/4, flowPIMinSet)
+	if p.conns == nil {
+		p.conns = map[*flowConn]flowPathConn{}
 	}
-	p.inFlight[c] = [2]int64{max(0, c.downOpenSent-c.downOpenReturned), c.kstat.unacked}
+	p.conns[c] = flowPathConn{max(0, c.downOpenSent-c.downOpenReturned), c.kstat.unacked, st.rtt - st.minRTT, now}
+	// The queue is the longest a connection has seen lately. Clients behind
+	// one address, as behind a carrier NAT, share the path without sharing
+	// a bottleneck: one with an empty path must not end another's verdict.
 	var in [2]int64
-	for _, n := range p.inFlight {
-		in[0], in[1] = in[0]+n[0], in[1]+n[1]
+	var queue time.Duration
+	for _, n := range p.conns {
+		in[0], in[1] = in[0]+n.inFlight, in[1]+n.inNet
+		if now.Sub(n.at) < flowPathFresh*st.rtt {
+			queue = max(queue, n.queue)
+		}
 	}
 	switch {
 	case !p.foreignAt.IsZero():

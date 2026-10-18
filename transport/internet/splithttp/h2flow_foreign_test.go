@@ -16,7 +16,7 @@ func queuedPath(c *flowConn, minRTT, rtt time.Duration) {
 	c.kstat = tcpStats{rtt: rtt, minRTT: minRTT}
 	c.rttBase = minRTT
 	if c.path == nil {
-		c.path, c.pathSet = &flowPath{inFlight: map[*flowConn][2]int64{}}, true
+		c.path, c.pathSet = &flowPath{conns: map[*flowConn]flowPathConn{}}, true
 	}
 }
 
@@ -145,7 +145,7 @@ func TestFlowForeignQueueEnds(t *testing.T) {
 // queue is foreign. A connection alone would have taken its own halving for
 // the verdict, with the other's data the queue.
 func TestFlowInFlightSpansConnections(t *testing.T) {
-	path := &flowPath{inFlight: map[*flowConn][2]int64{}}
+	path := &flowPath{conns: map[*flowConn]flowPathConn{}}
 	a := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
 	b := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
 	queuedPath(a, 50*time.Millisecond, 500*time.Millisecond)
@@ -164,7 +164,7 @@ func TestFlowInFlightSpansConnections(t *testing.T) {
 		t.Fatal("the path's data halved with the queue where it was, and it is not foreign")
 	}
 	path.release(a)
-	if _, ok := path.inFlight[a]; ok {
+	if _, ok := path.conns[a]; ok {
 		t.Fatal("a released connection still counts for the path")
 	}
 }
@@ -174,7 +174,7 @@ func TestFlowInFlightSpansConnections(t *testing.T) {
 // path keeps the least empty-path round trip of all its connections, 50 ms,
 // and the queue counts as foreign all the same.
 func TestFlowPathFloor(t *testing.T) {
-	path := &flowPath{inFlight: map[*flowConn][2]int64{}}
+	path := &flowPath{conns: map[*flowConn]flowPathConn{}}
 	early := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
 	queuedPath(early, 50*time.Millisecond, 60*time.Millisecond)
 	now := time.Now()
@@ -274,5 +274,37 @@ func TestFlowBarLeavesJitterOut(t *testing.T) {
 	inFlight(c, 1<<20)
 	if !judged(c, now.Add(time.Second)) {
 		t.Fatal("a queue of 600 ms that swings by 300 ms is not foreign")
+	}
+}
+
+// TestFlowPathTakesLongestQueue is two clients behind one address: A's
+// path holds a queue other traffic keeps at 450 ms, B's is empty. B's
+// reports must not end A's episode: the path takes the longest queue a
+// connection has seen lately, and A's queue is foreign all the same. Once
+// A has not reported for flowPathFresh round trips, its queue no longer
+// counts.
+func TestFlowPathTakesLongestQueue(t *testing.T) {
+	path := &flowPath{conns: map[*flowConn]flowPathConn{}}
+	a := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+	b := &flowConn{streams: map[uint32]*flowStream{}, path: path, pathSet: true}
+	queuedPath(a, 50*time.Millisecond, 500*time.Millisecond)
+	queuedPath(b, 50*time.Millisecond, 55*time.Millisecond)
+	now := time.Now()
+	inFlight(a, 4<<20)
+	a.foreignQueue(now)
+	b.foreignQueue(now.Add(time.Millisecond))
+	inFlight(a, 1<<20)
+	a.foreignQueue(now.Add(time.Second))
+	b.foreignQueue(now.Add(time.Second + time.Millisecond))
+	verdict := now.Add(time.Second + flowSuspectRounds*500*time.Millisecond)
+	if !a.foreignQueue(verdict) {
+		t.Fatal("a client with an empty path behind the same address ended another's verdict")
+	}
+	// Well inside flowForeignRounds of B's round trip, so that only A's
+	// queue going stale can end the verdict.
+	late := verdict.Add(flowPathFresh*55*time.Millisecond + time.Millisecond)
+	b.foreignQueue(late)
+	if b.foreignQueue(late.Add(flowSuspectRounds*55*time.Millisecond)) {
+		t.Fatal("a queue no connection has reported for long still holds the verdict")
 	}
 }
