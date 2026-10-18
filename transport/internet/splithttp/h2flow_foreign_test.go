@@ -308,3 +308,40 @@ func TestFlowPathTakesLongestQueue(t *testing.T) {
 		t.Fatal("a queue no connection has reported for long still holds the verdict")
 	}
 }
+
+// TestFlowNoQueueCuts is a download against a standing queue on a server
+// that leaves the queue to TCP: neither pi nor the cut at a long queue takes
+// its cap down, where the same server without the setting cuts it.
+func TestFlowNoQueueCuts(t *testing.T) {
+	for _, noCuts := range []bool{false, true} {
+		h, s := queuedDownload(t)
+		h.c.mu.Lock()
+		h.c.noQueueCuts = noCuts
+		h.c.mu.Unlock()
+		got := credit(h, s)
+		if cut := got < 1<<20; cut == noCuts {
+			t.Fatalf("noQueueCuts %v: the cap went from 1 MiB to %d", noCuts, got)
+		}
+	}
+}
+
+// TestFlowNoQueueCutsStopsPI is a queue of 60 ms over an empty 50 ms, short
+// of the cut at a long queue but well over pi's setpoint, on a download pi
+// governs: a client that returns credit in small steps, a reader that has
+// settled, a round trip measured. pi cuts it, unless the server leaves the
+// queue to TCP.
+func TestFlowNoQueueCutsStopsPI(t *testing.T) {
+	for _, noCuts := range []bool{false, true} {
+		h, s := queuedDownload(t)
+		h.c.mu.Lock()
+		h.c.noQueueCuts, h.c.incremental = noCuts, true
+		h.c.kstat.rtt = 110 * time.Millisecond
+		s.down.flat = flowFullRounds
+		s.down.mark = time.Now().Add(-200 * time.Millisecond)
+		h.c.mu.Unlock()
+		got := credit(h, s)
+		if cut := got < 1<<20; cut == noCuts {
+			t.Fatalf("noQueueCuts %v: pi took the cap from 1 MiB to %d", noCuts, got)
+		}
+	}
+}

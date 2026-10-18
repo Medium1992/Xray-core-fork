@@ -179,6 +179,9 @@ type flowListener struct {
 	// sendWindow is what one connection's client may hold, 0 for no
 	// limit, see flowConn.downRelease.
 	sendWindow int64
+	// noQueueCuts leaves the queue on the path to TCP, see
+	// flowConn.noQueueCuts.
+	noQueueCuts bool
 }
 
 func (l *flowListener) Accept() (net.Conn, error) {
@@ -187,7 +190,7 @@ func (l *flowListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	fc := newFlowConn(c, l.up, l.down)
-	fc.sendWindow = l.sendWindow
+	fc.sendWindow, fc.noQueueCuts = l.sendWindow, l.noQueueCuts
 	if l.connWindow > 0 {
 		fc.upConnGrant, fc.upConnGrantKnown = int64(max(l.connWindow, h2InitWindow)-h2InitWindow), true
 	}
@@ -679,6 +682,13 @@ type flowConn struct {
 	kstat tcpStats
 	kAt   time.Time
 	kOK   bool
+
+	// noQueueCuts leaves the queue on the path to TCP: a server that sets
+	// it neither runs pi nor cuts against a long queue, and its downloads'
+	// windows follow their readers alone, held while a queue stands. Such
+	// a server never takes a download below its share of a link that other
+	// traffic keeps full, and holds its own queue no shorter than TCP does.
+	noQueueCuts bool
 
 	// path is what this server's connections from the same client share
 	// of the queue, see foreignQueue, looked up once it is first needed:
@@ -1793,14 +1803,14 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
 		default:
 			q = c.queueing(now)
 		}
-		foreign := !c.client && c.foreignQueue(now)
+		foreign := !c.client && !c.noQueueCuts && c.foreignQueue(now)
 		if foreign {
 			q = 0
 		}
 		switch {
 		case c.client && c.modelled(now) && s.down.settled():
 			s.down.model(now, c.currentRTT(), c.down.init, c.down.max)
-		case !c.client && !foreign && c.incremental && s.down.flat >= flowFullRounds && c.modelled(now):
+		case !c.client && !c.noQueueCuts && !foreign && c.incremental && s.down.flat >= flowFullRounds && c.modelled(now):
 			// Only clients that credit in small steps: one that waits for
 			// half of its own window could be held below that half. Only
 			// where the kernel sees the path: behind a TCP proxy it sees
@@ -1817,7 +1827,7 @@ func (r *flowReader) control(f h2Frame, header, payload, out []byte) []byte {
 			if !c.floorConfirmed(now) {
 				s.down.cap = min(s.down.cap, flowUnconfirmedDown)
 			}
-		case q == 2 && now.Sub(s.down.qAt) >= c.currentRTT():
+		case q == 2 && !c.noQueueCuts && now.Sub(s.down.qAt) >= c.currentRTT():
 			s.down.qAt = now
 			s.down.cap = max(c.down.init, s.down.cap/4*3)
 		}
