@@ -121,11 +121,12 @@ func TestFlowForeignQueueEnds(t *testing.T) {
 		later := now.Add(2 * time.Second)
 		if drains {
 			c.kstat.rtt = 60 * time.Millisecond
-			if c.foreignQueue(later) {
-				later = later.Add(flowSuspectRounds * c.kstat.rtt)
-			} else {
-				t.Fatal("a queue that dipped under the bar for a moment ended the verdict")
+			for _, d := range []time.Duration{0, time.Millisecond, flowSuspectRounds*c.kstat.rtt - time.Millisecond} {
+				if !c.foreignQueue(later.Add(d)) {
+					t.Fatalf("a queue under the bar for %v ended the verdict", d)
+				}
 			}
+			later = later.Add(flowSuspectRounds * c.kstat.rtt)
 		} else {
 			later = now.Add(time.Second + flowForeignRounds*500*time.Millisecond)
 			if !c.foreignQueue(later.Add(-time.Millisecond)) {
