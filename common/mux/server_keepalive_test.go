@@ -80,3 +80,65 @@ func TestServerWorkerKeepAliveSkipsClosingWorker(t *testing.T) {
 		}
 	})
 }
+
+// stuckWriter is a downlink whose peer stopped reading: a write waits until
+// the worker interrupts the link.
+type stuckWriter struct {
+	writing chan struct{}
+	gone    chan struct{}
+}
+
+func (w stuckWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	buf.ReleaseMulti(mb)
+	w.writing <- struct{}{}
+	<-w.gone
+	return io.ErrClosedPipe
+}
+
+func (w stuckWriter) Close() error {
+	close(w.gone)
+	return nil
+}
+
+// idleConn asks for a KeepAlive every second and reports its downlink as long
+// silent.
+type idleConn struct{ net.Conn }
+
+func (idleConn) MuxKeepAlive() (int32, int32)      { return 1, 1 }
+func (idleConn) MuxKeepAliveBytes() (int32, int32) { return 0, 0 }
+func (idleConn) DownlinkIdle() time.Duration       { return time.Hour }
+
+// The KeepAlive loop ends with its worker, whether the worker closes while a
+// KeepAlive is stuck on the downlink or while the loop waits for the next
+// one: synctest.Test fails on any goroutine left blocked in the bubble.
+func TestServerWorkerKeepAliveEndsWithWorker(t *testing.T) {
+	log.RegisterHandler(discardLogs{})
+	t.Cleanup(func() { log.RegisterHandler(log.NewLogger(log.CreateStdoutLogWriter())) })
+	t.Run("stuck write", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			reader := idleReader{eof: make(chan struct{})}
+			defer close(reader.eof)
+			writer := stuckWriter{writing: make(chan struct{}), gone: make(chan struct{})}
+			ctx := session.ContextWithInbound(context.Background(), &session.Inbound{Conn: idleConn{}})
+			worker, err := mux.NewServerWorker(ctx, &TestDispatcher{}, &transport.Link{Reader: reader, Writer: writer})
+			common.Must(err)
+			<-writer.writing
+			common.Must(worker.Close())
+		})
+	})
+	t.Run("uplink ends", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			reader := idleReader{eof: make(chan struct{})}
+			writer := &countingWriter{}
+			ctx := session.ContextWithInbound(context.Background(), &session.Inbound{Conn: idleConn{}})
+			worker, err := mux.NewServerWorker(ctx, &TestDispatcher{}, &transport.Link{Reader: reader, Writer: writer})
+			common.Must(err)
+			time.Sleep(1500 * time.Millisecond)
+			close(reader.eof)
+			<-worker.WaitClosed()
+			if n := writer.writes.Load(); n < 1 {
+				t.Fatal("no KeepAlive before the uplink ended")
+			}
+		})
+	})
+}
