@@ -157,7 +157,6 @@ func TestFlowRecognisesEveryOutstandingPing(t *testing.T) {
 	}
 }
 
-
 // pingReaction connects to a server, answers the first PING it sends (or uses
 // a fixed payload when it sends none) with the frames build returns, and
 // reports how the server reacts, as h2Reaction does.
