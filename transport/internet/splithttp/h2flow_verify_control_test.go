@@ -157,8 +157,6 @@ func TestFlowRecognisesEveryOutstandingPing(t *testing.T) {
 	}
 }
 
-// TestFlowForgetsOldestPings is not transplanted: it tests flowPingSlots, a
-// mechanism of the pr17-fixes branch that bdbac60e does not have.
 
 // pingReaction connects to a server, answers the first PING it sends (or uses
 // a fixed payload when it sends none) with the frames build returns, and
@@ -203,7 +201,7 @@ func pingReaction(t *testing.T, addr string, build func(ping [8]byte) []byte) st
 	}
 }
 
-// TestFlowPingViolationsGetStockErrors (added for bdbac60e) answers the
+// TestFlowPingViolationsGetStockErrors answers the
 // governor's PING with an ACK that stock HTTP/2 rejects, on a stock and a
 // governed server: on stream 1, and between HEADERS and its CONTINUATION.
 func TestFlowPingViolationsGetStockErrors(t *testing.T) {

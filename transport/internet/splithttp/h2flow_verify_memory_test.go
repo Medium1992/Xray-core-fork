@@ -110,7 +110,7 @@ func (c *rawH2Client) pump(quiet time.Duration) {
 	}
 }
 
-// TestFlowServerUnreadPerConnection (added for bdbac60e) opens 32 upload
+// TestFlowServerUnreadPerConnection opens 32 upload
 // streams whose handlers never read and counts what the server accepts on
 // the connection. Stock Go holds that to its 1 MiB connection window; the
 // PR states that a governed server reaches its 6 MiB only "while the outbound
@@ -185,7 +185,7 @@ func (l *blockingListener) Accept() (net.Conn, error) {
 	return fc, nil
 }
 
-// TestFlowInjectedQueueBounded (added for bdbac60e) stops reading on the
+// TestFlowInjectedQueueBounded stops reading on the
 // client so the server's writes block, then opens and resets streams. Every
 // new stream makes the governor queue upload credit for the client, outside
 // net/http's own control-frame limit, and nothing drains it while the write
@@ -271,7 +271,7 @@ func TestFlowInjectedQueueBounded(t *testing.T) {
 	}
 }
 
-// TestFlowProtoField32 (added for bdbac60e) checks the generated descriptor
+// TestFlowProtoField32 checks the generated descriptor
 // for the new field and a wire round trip.
 func TestFlowProtoField32(t *testing.T) {
 	fd := (&Config{}).ProtoReflect().Descriptor().Fields().ByNumber(32)

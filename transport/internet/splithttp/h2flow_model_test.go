@@ -428,7 +428,7 @@ func (m *flowModel) changeClientWindow() {
 		}
 		fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: uint32(next)})
 	}, false)
-	// Adapted to bdbac60e: it has no broken flag; a governor that gives up
+	// A governor that gives up
 	// releases its state, which sets closed.
 	m.c.mu.Lock()
 	broken := m.c.closed
@@ -621,7 +621,7 @@ func TestFlowModelWindowChanges(t *testing.T) {
 	}
 }
 
-// TestFlowModelWindowChangesLenient (added for bdbac60e) runs the window-change
+// TestFlowModelWindowChangesLenient runs the window-change
 // model without requiring the governor to give up an inexpressible change:
 // only the stock invariants judge, i.e. the server never sends beyond the
 // client's real window and no stream stalls after both readers drain.

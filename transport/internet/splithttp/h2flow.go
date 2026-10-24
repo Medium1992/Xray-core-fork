@@ -914,7 +914,7 @@ const (
 // client's upload, or of a download towards a client this side dialed from.
 // A PING's ACK waits behind whatever is queued between the peers, so the last
 // round trip, or the wait for an ACK still due, above the lowest one this
-// connection has seen is that backlog. Like the kernel's min_rtt, the floor
+// connection has seen is that backlog. The floor
 // is kept for the connection's life: a long transfer keeps the queue full, and
 // a floor that forgot the empty path would rise with it. A PING samples it only
 // once a second, so it reacts at half the queue the kernel signal tolerates.

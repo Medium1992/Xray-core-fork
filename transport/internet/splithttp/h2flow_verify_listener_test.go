@@ -166,9 +166,9 @@ func TestFlowListenerGovernsTLSHTTP2(t *testing.T) {
 // TestFlowConnKeepsOptionalInterfaces checks the wrapper against the inner
 // connection: net/http sees TLS exactly when the inner connection is TLS,
 // and unwrapping and half-close still reach the inner connection.
-// Adapted to bdbac60e: newFlowConn is the only constructor; the TLS
+// The TLS
 // interfaces are the ones net/http itself asserts (*tls.Conn, or
-// ConnectionState/HandshakeContext on the fixes branch).
+// ConnectionState/HandshakeContext).
 func TestFlowConnKeepsOptionalInterfaces(t *testing.T) {
 	plain, peer := net.Pipe()
 	defer plain.Close()
@@ -207,7 +207,7 @@ func TestFlowConnKeepsOptionalInterfaces(t *testing.T) {
 // takes HTTP/2 exactly when ALPN picked h2, as net/http does: with any other
 // protocol net/http serves HTTP/1.x only, even after an HTTP/2 preface, and
 // the governor must not parse that as frames.
-// Adapted to bdbac60e: there is no handshake hook, so the client sends the
+// There is no handshake hook, so the client sends the
 // HTTP/2 preface after the handshake and the mode is read after the
 // governor has seen it, as net/http would read it.
 func TestFlowTLSModeFollowsALPN(t *testing.T) {
@@ -251,7 +251,7 @@ func TestFlowTLSModeFollowsALPN(t *testing.T) {
 	}
 }
 
-// TestFlowListenerSendsSettingsBeforePreface (added for bdbac60e) states
+// TestFlowListenerSendsSettingsBeforePreface states
 // the order serverSettings relies on as its own check: after TLS with ALPN
 // h2, a stock XHTTP listener sends its SETTINGS before the client preface;
 // the governed one must too, since a prober can tell the two apart.
@@ -338,7 +338,7 @@ func TestFlowListenerSendsOnlySettingsBeforePreface(t *testing.T) {
 	}
 }
 
-// TestFlowListenerGovernsTLSHTTP2AfterPreface (added for bdbac60e) is
+// TestFlowListenerGovernsTLSHTTP2AfterPreface is
 // TestFlowListenerGovernsTLSHTTP2 with the client preface sent first, to
 // separate whether the governor rewrites the SETTINGS from when they leave.
 func TestFlowListenerGovernsTLSHTTP2AfterPreface(t *testing.T) {
@@ -375,7 +375,7 @@ func TestFlowListenerGovernsTLSHTTP2AfterPreface(t *testing.T) {
 	}
 }
 
-// TestFlowListenerClosesLikeStock (added for bdbac60e) sends an HTTP/1.1
+// TestFlowListenerClosesLikeStock sends an HTTP/1.1
 // request whose headers exceed MaxHeaderBytes. net/http answers 431 and
 // calls CloseWrite on the connection before it waits rstAvoidanceDelay, so
 // with stock TLS the client sees close_notify right after the answer. The

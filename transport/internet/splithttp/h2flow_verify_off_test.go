@@ -11,7 +11,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-// TestFlowOffLeavesStockWiring (added for bdbac60e) checks the default: with
+// TestFlowOffLeavesStockWiring checks the default: with
 // XRAY_XHTTP_FLOW unset and no "h2Flow", ListenXH does not wrap its listener,
 // net/http gets Go's HTTP/2 windows, and the client transport is Go's.
 func TestFlowOffLeavesStockWiring(t *testing.T) {
