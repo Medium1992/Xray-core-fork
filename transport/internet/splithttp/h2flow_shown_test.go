@@ -21,10 +21,14 @@ func TestFlowClientPastShownWindow(t *testing.T) {
 		name       string
 		connCredit uint32
 		streamCred uint32
+		// wideConn shows the client more of the connection than any stream
+		// holds, so that the stream's window is the one it sends past.
+		wideConn bool
 	}{
-		{"no credit", 0, 0},
-		{"connection credit", 8 << 20, 0},
-		{"stream and connection credit", 8 << 20, 4 << 20},
+		{"no credit", 0, 0, false},
+		{"connection credit", 8 << 20, 0, false},
+		{"stream and connection credit", 8 << 20, 4 << 20, false},
+		{"connection window over the stream's", 8 << 20, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newFlowHarness(t)
@@ -46,8 +50,13 @@ func TestFlowClientPastShownWindow(t *testing.T) {
 					conn += int64(wu.Increment)
 				}
 			}
+			if tc.wideConn {
+				h.c.mu.Lock()
+				h.c.upConnForwarded += 8 << 20
+				h.c.mu.Unlock()
+				conn += 8 << 20
+			}
 			shown := min(conn, h.toClient.streams[1])
-			t.Logf("stream window %d, connection window %d", h.toClient.streams[1], conn)
 			h.fromClient(func(fr *http2.Framer) { writeDataSplit(fr, 1, int(shown)) })
 			if h.readErr != nil || h.c.isBroken() {
 				t.Fatalf("data within the %d shown ended the connection: %v", shown, h.readErr)
