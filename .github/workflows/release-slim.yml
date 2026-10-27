@@ -81,10 +81,10 @@ jobs:
         run: |
           set -eux
           go version
-          # Тег v26.10.10-mux-ka-11 даёт версию 26.10.10-mux-ka-11.
+          # Тег v26.10.21-h2Flow даёт версию 26.10.21-h2Flow, v26.10.10-mux-ka-11 — 26.10.10-mux-ka-11.
           case "$TAG" in
-            v[0-9]*.[0-9]*.[0-9]*-mux-ka-[0-9]*) EDITION="-${TAG#*-}" ;;
-            *) echo "Тег '$TAG' не вида vX.Y.Z-mux-ka-N" >&2; exit 1 ;;
+            v[0-9]*.[0-9]*.[0-9]*-h2Flow|v[0-9]*.[0-9]*.[0-9]*-h2Flow-[0-9]*|v[0-9]*.[0-9]*.[0-9]*-mux-ka-[0-9]*) EDITION="-${TAG#*-}" ;;
+            *) echo "Тег '$TAG' не вида vX.Y.Z-h2Flow[-N] или vX.Y.Z-mux-ka-N" >&2; exit 1 ;;
           esac
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
