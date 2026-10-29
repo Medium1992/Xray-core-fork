@@ -10,13 +10,7 @@ name: Slim Release
 #   - скретч h2-аплоада (512k -> 32k на стрим) нужен, когда узел сам ходит
 #     XHTTP-клиентом к следующему хопу (транзиты). Под Go 1.27 http2.Transport
 #     из x/net оборачивает net/http, и рабочий буфер живёт в стандартной
-#     библиотеке; с http2legacy — в самом x/net. Патчатся оба, здесь в CI,
-#     чтобы ограничение действовало с любым из транспортов.
-#
-# BUILD_TAGS=http2legacy возвращает собственный пул соединений x/net: под
-# Go 1.27 без него каждый запрос, ждущий зависший TLS-хендшейк, открывает свой
-# TCP, и xmux.maxConnections перестаёт ограничивать сокеты
-# (XTLS/Xray-core#6797). Убрать, когда это починят в Xray или Go.
+#     библиотеке; он патчится здесь, в CI.
 
 on:
   workflow_dispatch:
@@ -41,7 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
-      BUILD_TAGS: http2legacy
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,16 +57,6 @@ jobs:
               || { echo "h2 scratch patch did not apply to $1" >&2; exit 1; }
           }
           patch_scratch "$(go env GOROOT)/src/net/http/internal/http2/transport.go"
-          go mod vendor
-          patch_scratch vendor/golang.org/x/net/http2/transport.go
-          files=" $(go list -mod=vendor -tags "$BUILD_TAGS" -f '{{join .GoFiles " "}}' golang.org/x/net/http2) "
-          case ",$BUILD_TAGS," in
-            *,http2legacy,*)
-              case "$files" in
-                *" transport.go "*) ;;
-                *) echo "http2legacy no longer selects x/net's own transport" >&2; exit 1 ;;
-              esac ;;
-          esac
 
       - name: Build
         env:
@@ -88,7 +71,7 @@ jobs:
           esac
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
-              go build -mod=vendor -tags "$BUILD_TAGS" -v -trimpath \
+              go build -v -trimpath \
                 -ldflags "-s -w -buildid= -X github.com/xtls/xray-core/core.edition=$EDITION" \
                 -o "xray-linux-$arch" ./main
           done
