@@ -231,7 +231,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					break // ensure order
 				}
 			}
-			if peerPub2 == nil {
+			if peerPub2 == nil && !(config.AllowX25519 && peerPub != nil) {
 				break // reject outdated/strange Client Hello that doesn't have X25519MLKEM768 before optional X25519
 			}
 			if peerPub == nil {

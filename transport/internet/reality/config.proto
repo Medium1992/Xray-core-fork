@@ -21,6 +21,7 @@ message Config {
   bytes mldsa65_seed = 11;
   LimitFallback limit_fallback_upload = 12;
   LimitFallback limit_fallback_download = 13;
+  bool allow_x25519 = 50;
 
   string Fingerprint = 21;
   string server_name = 22;

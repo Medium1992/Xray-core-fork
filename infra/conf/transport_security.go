@@ -36,6 +36,7 @@ type REALITYConfig struct {
 	MinClientVer string          `json:"minClientVer"`
 	MaxClientVer string          `json:"maxClientVer"`
 	MaxTimeDiff  uint64          `json:"maxTimeDiff"`
+	AllowX25519  bool            `json:"allowX25519"`
 	ShortIds     []string        `json:"shortIds"`
 	Mldsa65Seed  string          `json:"mldsa65Seed"`
 
@@ -150,6 +151,7 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 		config.Xver = c.Xver
 		config.ServerNames = c.ServerNames
 		config.MaxTimeDiff = c.MaxTimeDiff
+		config.AllowX25519 = c.AllowX25519
 
 		if c.Mldsa65Seed != "" {
 			if c.Mldsa65Seed == c.PrivateKey {

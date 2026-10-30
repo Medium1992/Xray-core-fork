@@ -27,6 +27,7 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 		MinClientVer: c.MinClientVer,
 		MaxClientVer: c.MaxClientVer,
 		MaxTimeDiff:  time.Duration(c.MaxTimeDiff) * time.Millisecond,
+		AllowX25519:  c.AllowX25519,
 
 		NextProtos:             nil, // should be nil
 		SessionTicketsDisabled: true,

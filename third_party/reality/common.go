@@ -600,6 +600,10 @@ type Config struct {
 	MaxTimeDiff  time.Duration
 	ShortIds     map[[8]byte]bool
 
+	// AllowX25519 accepts a Client Hello whose only usable key share is
+	// X25519, as before X25519MLKEM768 became required.
+	AllowX25519 bool
+
 	Mldsa65Key *mldsa.PrivateKey
 
 	LimitFallbackUpload   LimitFallback
@@ -1056,6 +1060,7 @@ func (c *Config) Clone() *Config {
 		MaxClientVer:          c.MaxClientVer,
 		MaxTimeDiff:           c.MaxTimeDiff,
 		ShortIds:              c.ShortIds,
+		AllowX25519:           c.AllowX25519,
 		Mldsa65Key:            c.Mldsa65Key,
 		LimitFallbackUpload:   c.LimitFallbackUpload,
 		LimitFallbackDownload: c.LimitFallbackDownload,
