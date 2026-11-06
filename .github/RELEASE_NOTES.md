@@ -2,6 +2,10 @@
 
 Постоянные ссылки на последнюю версию (всегда ведут на актуальный релиз): [страница](https://github.com/Medium1992/Xray-core-fork/releases/latest), [linux/amd64](https://github.com/Medium1992/Xray-core-fork/releases/latest/download/xray-linux-amd64), [linux/arm64](https://github.com/Medium1992/Xray-core-fork/releases/latest/download/xray-linux-arm64).
 
+## Что нового в v26.10.31-h2Flow-4
+
+- **BitTorrent: ещё три сигнатуры.** Правило `"protocol": ["bittorrent"]` теперь ловит HTTP-запрос к трекеру (`GET` с `info_hash=` и `peer_id=` или `/scrape?` в строке запроса; раньше он уходил как обычный HTTP), локальный поиск пиров LSD (`BT-SEARCH * HTTP/1.1`) и пакет uTP с данными, который открывается рукопожатием BitTorrent. Это те же признаки, по которым хостинги со своим DPI (например, vh-dpid у VibeHost) засчитывают торрент наверняка. На настоящем клиенте анонс трекера и рукопожатие в uTP ловятся; на 2 млн случайных датаграмм, миллионе HTTP-запросов и пакетах SSDP, QUIC и TLS ложных срабатываний нет. HTTPS-трекеры по-прежнему видны только по домену, держите рядом `geosite:category-public-tracker`.
+
 ## Что нового в v26.10.31-h2Flow-3
 
 - **Исправлено: uTP снова определяется как BitTorrent.** В v26.10.31-h2Flow-2 сниффер uTP (из Jolymmiles/Xray-core) принимал ST_SYN только с номером последовательности 1. libutp и libtorrent (uTorrent, Transmission, qBittorrent, Deluge) начинают его со случайного числа, так что правило `"protocol": ["bittorrent"]` пропускало uTP почти целиком: из 200 000 SYN со случайным номером ловились 4. Теперь SYN узнаётся по нулевой разнице таймстемпов и цепочке расширений, как в апстриме, а DNS-запросы отсекаются по заголовку: из 4,3 млн запросов (все ID транзакции, 11 имён, A, AAAA, HTTPS, с EDNS и без) за BitTorrent не принят ни один. Против торрентов на сервере вместе с правилом `bittorrent` стоит держать `geosite:category-public-tracker`: HTTP(S)-трекеры сниффер не видит, а соединения с пирами, зашифрованные MSE, не видит никакой сниффер.
