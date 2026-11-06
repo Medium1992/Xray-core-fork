@@ -49,6 +49,24 @@ func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
 	return nil
 }
 
+// Datagrams returns the cached buffers that the first size bytes of the
+// cache hold whole, each on its own. Each buffer of a UDP link is a datagram
+// of its own, so these are the datagrams of the flow. They are borrowed until
+// the cache is read.
+func (r *cachedReader) Datagrams(size int32) [][]byte {
+	r.Lock()
+	defer r.Unlock()
+	var datagrams [][]byte
+	for _, b := range r.cache {
+		if b.Len() > size {
+			break
+		}
+		datagrams = append(datagrams, b.Bytes())
+		size -= b.Len()
+	}
+	return datagrams
+}
+
 func (r *cachedReader) readInternal() buf.MultiBuffer {
 	r.Lock()
 	defer r.Unlock()
@@ -404,7 +422,11 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 				cacheDeadline -= cachingTimeElapsed
 
 				if !payload.IsEmpty() {
-					result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
+					var datagrams [][]byte
+					if network == net.Network_UDP {
+						datagrams = cReader.Datagrams(payload.Len())
+					}
+					result, err := sniffer.SniffDatagrams(ctx, payload.Bytes(), datagrams, network)
 					switch err {
 					case common.ErrNoClue: // No Clue: protocol not matches, and sniffer cannot determine whether there will be a match or not
 						totalAttempt++
