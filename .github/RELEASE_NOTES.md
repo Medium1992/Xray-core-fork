@@ -2,6 +2,10 @@
 
 Постоянные ссылки на последнюю версию (всегда ведут на актуальный релиз): [страница](https://github.com/Medium1992/Xray-core-fork/releases/latest), [linux/amd64](https://github.com/Medium1992/Xray-core-fork/releases/latest/download/xray-linux-amd64), [linux/arm64](https://github.com/Medium1992/Xray-core-fork/releases/latest/download/xray-linux-arm64).
 
+## Что нового в v26.10.31-h2Flow-3
+
+- **Исправлено: uTP снова определяется как BitTorrent.** В v26.10.31-h2Flow-2 сниффер uTP (из Jolymmiles/Xray-core) принимал ST_SYN только с номером последовательности 1. libutp и libtorrent (uTorrent, Transmission, qBittorrent, Deluge) начинают его со случайного числа, так что правило `"protocol": ["bittorrent"]` пропускало uTP почти целиком: из 200 000 SYN со случайным номером ловились 4. Теперь SYN узнаётся по нулевой разнице таймстемпов и цепочке расширений, как в апстриме, а DNS-запросы отсекаются по заголовку: из 4,3 млн запросов (все ID транзакции, 11 имён, A, AAAA, HTTPS, с EDNS и без) за BitTorrent не принят ни один. Против торрентов на сервере вместе с правилом `bittorrent` стоит держать `geosite:category-public-tracker`: HTTP(S)-трекеры сниффер не видит, а соединения с пирами, зашифрованные MSE, не видит никакой сниффер.
+
 ## Что нового в v26.10.31-h2Flow-2
 
 - **Сниффер STUN.** Правило `"protocol": ["stun"]` в `routing` ловит STUN (RFC 8489/5389) и TURN поверх UDP и TCP: проверки ICE в WebRTC и звонках WhatsApp, Telegram и FaceTime, если они используют стандартный STUN, и выделение relay. В ICE медиа идёт по тем же портам, что и проверки, поэтому правило уводит весь звонок: на нужную ноду, напрямую или в блок. Нужен включённый `sniffing`, `destOverride` трогать не нужно: домена у STUN нет. Классический STUN без magic cookie (RFC 3489) не ловится: без cookie признаков слишком мало, и сниффер путал бы его с другим UDP.
