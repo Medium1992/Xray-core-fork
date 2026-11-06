@@ -2,6 +2,19 @@
 
 Постоянные ссылки на последнюю версию (всегда ведут на актуальный релиз): [страница](https://github.com/Medium1992/Xray-core-fork/releases/latest), [linux/amd64](https://github.com/Medium1992/Xray-core-fork/releases/latest/download/xray-linux-amd64), [linux/arm64](https://github.com/Medium1992/Xray-core-fork/releases/latest/download/xray-linux-arm64).
 
+## Что нового в v26.10.31-h2Flow-2
+
+- **Сниффер STUN.** Правило `"protocol": ["stun"]` в `routing` ловит STUN (RFC 8489/5389) и TURN поверх UDP и TCP: проверки ICE в WebRTC и звонках WhatsApp, Telegram и FaceTime, если они используют стандартный STUN, и выделение relay. В ICE медиа идёт по тем же портам, что и проверки, поэтому правило уводит весь звонок: на нужную ноду, напрямую или в блок. Нужен включённый `sniffing`, `destOverride` трогать не нужно: домена у STUN нет. Классический STUN без magic cookie (RFC 3489) не ловится: без cookie признаков слишком мало, и сниффер путал бы его с другим UDP.
+
+  ```json
+  "routing": {"rules": [
+    {"type": "field", "protocol": ["stun"], "outboundTag": "calls"}
+  ]}
+  ```
+
+- **BitTorrent: DHT и UDP-трекеры.** Правило `"protocol": ["bittorrent"]` раньше пропускало DHT (BEP 5) и UDP-трекеры (BEP 15), то есть первый UDP-трафик торрент-клиента; теперь ловит. Исправлено и то, что DNS-запрос мог приниматься за uTP. Из Jolymmiles/Xray-core.
+- **TLS: ClientHello в нескольких записях.** ClientHello, разбитый на несколько TLS-записей (так делают zapret, byedpi и другие обходы DPI), раньше не разбирался, и соединение теряло домен для маршрутизации и `destOverride`. Теперь домен читается. Из Jolymmiles/Xray-core.
+
 ## Что нового в v26.10.31-h2Flow-1
 
 - **Исправлено: PI-регулятор считал скорость загрузки, ушедшей из PI.** Когда на одном соединении несколько загрузок выходили из PI (читатель ограничен своей скоростью, а маршрут стал вчетверо быстрее) и возвращались не одновременно, оставшиеся в PI шагали вверх по средней доле, куда входила старая скорость ушедших. Теперь вне PI эта скорость забывается, как ошибка и RTT, и загрузка возвращается под PI как новая. На стендах это задевало меньше 0,2% шагов вверх; скорость, задержки, память и CPU те же. Найдено в ревью Jolymmiles/Xray-core#75, исправление — Jolymmiles/Xray-core#76.
