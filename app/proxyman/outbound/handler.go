@@ -87,7 +87,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 			h.senderSettings = s
 			mss, err := internet.ToMemoryStreamConfig(s.StreamSettings)
 			if err != nil {
-				return nil, errors.New("failed to parse stream settings").Base(err).AtWarning()
+				return nil, errors.New("failed to parse stream settings").Base(err)
 			}
 			h.streamSettings = mss
 		default:
@@ -122,8 +122,8 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 			if config.Concurrency < 0 {
 				h.mux = &mux.ClientManager{Enabled: false}
 			}
-			if config.Concurrency == 0 {
-				config.Concurrency = 8 // same as before
+			if config.Concurrency >= 0 && config.Concurrency <= 128 {
+				config.Concurrency = 128
 			}
 			if config.Concurrency > 0 {
 				h.mux = &mux.ClientManager{
@@ -134,7 +134,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.Concurrency),
-								MaxConnection:  128,
+								MaxConnection:  1024,
 							},
 						},
 					},
@@ -155,7 +155,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.XudpConcurrency),
-								MaxConnection:  128,
+								MaxConnection:  1024,
 							},
 						},
 					},
@@ -217,7 +217,7 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 		if ob.Target.Network == net.Network_UDP && ob.Target.Port == 443 {
 			switch h.udp443 {
 			case "reject":
-				test(errors.New("XUDP rejected UDP/443 traffic").AtInfo())
+				test(errors.New("XUDP rejected UDP/443 traffic"))
 				return
 			case "skip":
 				goto out
