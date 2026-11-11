@@ -8,6 +8,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/protocol/bittorrent"
+	"github.com/xtls/xray-core/common/protocol/discord"
 	"github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/protocol/quic"
 	"github.com/xtls/xray-core/common/protocol/stun"
@@ -60,6 +61,14 @@ func NewSniffer(ctx context.Context) *Sniffer {
 				// A STUN message over UDP is its first datagram.
 				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
 					return stun.SniffSTUNDatagram(datagrams[0])
+				},
+				network: net.Network_UDP,
+			},
+			{
+				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return discord.SniffIPDiscovery(b) },
+				// The request is the first datagram of a voice flow.
+				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
+					return discord.SniffIPDiscovery(datagrams[0])
 				},
 				network: net.Network_UDP,
 			},
