@@ -1,8 +1,6 @@
 package mux
 
 import (
-	"sync"
-
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
@@ -10,28 +8,6 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
 )
-
-type MutexWriter struct {
-	sync.Mutex
-	buf.Writer
-}
-
-func (w *MutexWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	w.Lock()
-	defer w.Unlock()
-	return w.Writer.WriteMultiBuffer(mb)
-}
-
-// Interrupt and Close reach the writer inside without the lock: a worker
-// ends its link through them, and a write stuck on a peer that stopped
-// reading holds the lock until the link ends.
-func (w *MutexWriter) Interrupt() {
-	common.Interrupt(w.Writer)
-}
-
-func (w *MutexWriter) Close() error {
-	return common.Close(w.Writer)
-}
 
 type Writer struct {
 	dest         net.Destination
