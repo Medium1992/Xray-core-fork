@@ -52,7 +52,14 @@ func NewSniffer(ctx context.Context) *Sniffer {
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) }, network: net.Network_TCP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return stun.SniffSTUN(b) }, network: net.Network_TCP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) }, network: net.Network_UDP},
-			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) }, network: net.Network_UDP},
+			{
+				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) },
+				// A SYN is a whole datagram: read the first one, not the batch.
+				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
+					return bittorrent.SniffUTP(datagrams[0])
+				},
+				network: net.Network_UDP,
+			},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffDHT(b) }, network: net.Network_UDP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUDPTracker(b) }, network: net.Network_UDP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffLSD(b) }, network: net.Network_UDP},
