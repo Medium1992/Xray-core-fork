@@ -75,7 +75,7 @@ func NewSniffer(ctx context.Context) *Sniffer {
 				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) },
 				// A SYN is a whole datagram: read the first one, not the batch.
 				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
-					return bittorrent.SniffUTP(datagrams[0])
+					return bittorrent.SniffUTPDatagram(datagrams[0])
 				},
 				network: net.Network_UDP,
 			},
