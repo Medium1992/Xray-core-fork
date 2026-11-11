@@ -191,7 +191,7 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *buf
 	if err := dispatcher.DispatchLink(
 		ctx, dest, &transport.Link{
 			Reader: reader,
-			Writer: buf.NewWriter(conn),
+			Writer: proxy.NewHalfClosingWriter(conn),
 		},
 	); err != nil {
 		return errors.New("failed to dispatch request").Base(err)

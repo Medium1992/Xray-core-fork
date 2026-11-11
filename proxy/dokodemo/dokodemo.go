@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -159,7 +160,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 
 	var writer buf.Writer
 	if network == net.Network_TCP {
-		writer = buf.NewWriter(conn)
+		writer = proxy.NewHalfClosingWriter(conn)
 	} else {
 		// if we are in TPROXY mode, use linux's udp forging functionality
 		if !destinationOverridden {

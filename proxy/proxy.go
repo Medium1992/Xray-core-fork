@@ -825,3 +825,38 @@ func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
 	_, ok3 := iConn.(*internet.UnixConnWrapper)
 	return ok1 || ok2 || ok3
 }
+
+// CloseWriteRAW ends what conn sends with a FIN when conn is a plain TCP or
+// Unix socket, and does nothing on any other conn: there a FIN is no end of
+// stream the peer reads, and closing a TLS writer would send close_notify.
+func CloseWriteRAW(conn net.Conn) error {
+	iConn := stat.TryUnwrapStatsConn(conn)
+	if pc, ok := iConn.(*proxyproto.Conn); ok {
+		iConn = pc.Raw()
+	}
+	switch c := iConn.(type) {
+	case *net.TCPConn:
+		return c.CloseWrite()
+	case *net.UnixConn:
+		return c.CloseWrite()
+	case *internet.UnixConnWrapper:
+		return c.CloseWrite()
+	}
+	return nil
+}
+
+// NewHalfClosingWriter is buf.NewWriter(conn) whose Close passes the end of
+// the stream on as conn's FIN (see CloseWriteRAW), as closing a pipe writer
+// ends its reader's stream. The peer reads its EOF while it may still send.
+func NewHalfClosingWriter(conn net.Conn) buf.Writer {
+	return &halfClosingWriter{Writer: buf.NewWriter(conn), conn: conn}
+}
+
+type halfClosingWriter struct {
+	buf.Writer
+	conn net.Conn
+}
+
+func (w *halfClosingWriter) Close() error {
+	return CloseWriteRAW(w.conn)
+}

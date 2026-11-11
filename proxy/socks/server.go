@@ -157,7 +157,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 		if err := dispatcher.DispatchLink(
 			ctx, dest, &transport.Link{
 				Reader: reader,
-				Writer: buf.NewWriter(conn),
+				Writer: proxy.NewHalfClosingWriter(conn),
 			},
 		); err != nil {
 			return errors.New("failed to dispatch request").Base(err)
