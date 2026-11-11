@@ -42,12 +42,31 @@ type Sniffer struct {
 	sniffer []protocolSnifferWithMetadata
 }
 
+// sniffHTTPOrTracker is SniffHTTP but for an HTTP tracker request, which is
+// BitTorrent (BEP 3) riding on HTTP: its protocol is bittorrent, and its
+// domain is the HTTP Host, overridden as HTTP's is.
+func sniffHTTPOrTracker(c context.Context, b []byte) (SniffResult, error) {
+	tracker, trackerErr := bittorrent.SniffHTTPTracker(b)
+	h, err := http.SniffHTTP(b, c)
+	if err == nil && trackerErr == nil {
+		return CompositeResult(h, tracker), nil
+	}
+	if err == nil {
+		return h, nil
+	}
+	if trackerErr != nil {
+		return nil, err
+	}
+	if err == common.ErrNoClue || err == protocol.ErrProtoNeedMoreData {
+		return nil, err
+	}
+	return tracker, nil
+}
+
 func NewSniffer(ctx context.Context) *Sniffer {
 	ret := &Sniffer{
 		sniffer: []protocolSnifferWithMetadata{
-			// Before HTTP, which would take a tracker request for HTTP.
-			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffHTTPTracker(b) }, network: net.Network_TCP},
-			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return http.SniffHTTP(b, c) }, network: net.Network_TCP},
+			{protocolSniffer: sniffHTTPOrTracker, network: net.Network_TCP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return tls.SniffTLS(b) }, network: net.Network_TCP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) }, network: net.Network_TCP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return stun.SniffSTUN(b) }, network: net.Network_TCP},

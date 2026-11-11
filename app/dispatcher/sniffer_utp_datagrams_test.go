@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"bytes"
-	"context"
 	"testing"
 	"time"
 
@@ -37,7 +36,7 @@ func TestSniffUTPReadsTheFirstDatagram(t *testing.T) {
 				}
 			}
 			reader := newTestCachedReader(t, r)
-			result, err := sniff(context.Background(), reader, false, net.Network_UDP, newSniffer(snifferContext()))
+			result, err := sniff(snifferContext(), reader, false, net.Network_UDP, newSniffer(snifferContext()))
 			forwarded, readErr := reader.ReadMultiBufferTimeout(time.Millisecond)
 			if readErr != nil {
 				t.Fatal(readErr)

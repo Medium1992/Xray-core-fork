@@ -4,6 +4,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	stdnet "net"
+	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -57,4 +58,27 @@ func tlsClientHello() []byte {
 	_ = conn.HandshakeContext(ctx)
 
 	return <-captured
+}
+
+func newTestCachedReader(t *testing.T, link buf.TimeoutReader) *cachedReader {
+	t.Helper()
+	reader := newCachedReader(link)
+	t.Cleanup(func() {
+		reader.Lock()
+		buf.ReleaseMulti(reader.cache)
+		reader.cache = nil
+		reader.Unlock()
+	})
+	return reader
+}
+
+// countingReader is a datagramReader that counts the reads of its link.
+type countingReader struct {
+	datagramReader
+	reads int
+}
+
+func (r *countingReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
+	r.reads++
+	return r.datagramReader.ReadMultiBufferTimeout(timeout)
 }
