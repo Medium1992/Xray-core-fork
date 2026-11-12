@@ -3,10 +3,35 @@ package splithttp
 import (
 	"context"
 	gonet "net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/xtls/xray-core/common/platform"
 )
+
+// hedgeEnabled turns on dialHedged for the XHTTP client: off unless
+// XRAY_XHTTP_DIAL_HEDGE is on, true or 1. While a handshake hangs, a hedged
+// dial sends up to three more ClientHellos to the server within seconds,
+// which a censor may block on; without it the client waits on one attempt
+// until the handshake bound. It is read again when the config's "env"
+// changes the environment.
+var hedgeEnabled atomic.Bool
+
+func reloadHedgeEnv() error {
+	switch strings.ToLower(strings.TrimSpace(platform.NewEnvFlag(platform.XHTTPDialHedge).GetValue(func() string { return "" }))) {
+	case "on", "true", "1":
+		hedgeEnabled.Store(true)
+	default:
+		hedgeEnabled.Store(false)
+	}
+	return nil
+}
+
+func init() {
+	platform.RegisterEnvReload(reloadHedgeEnv)
+}
 
 // maxDialAttempts bounds the attempts of one dial that run side by side.
 const maxDialAttempts = 4
@@ -123,7 +148,7 @@ func (d *hedgedDialer) Dial(ctx context.Context) (gonet.Conn, error) {
 	}
 	var conn gonet.Conn
 	var err error
-	if h.failed.Load() {
+	if !hedgeEnabled.Load() || h.failed.Load() {
 		conn, err = timed(ctx)
 	} else {
 		conn, err = dialHedged(ctx, hedgeDelay(time.Duration(h.lastHandshake.Load())), timed)

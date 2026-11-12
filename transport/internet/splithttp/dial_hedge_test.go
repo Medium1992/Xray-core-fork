@@ -18,6 +18,14 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+// withHedge turns hedged dials on for the test, as XRAY_XHTTP_DIAL_HEDGE=on.
+func withHedge(t *testing.T) {
+	t.Helper()
+	was := hedgeEnabled.Load()
+	hedgeEnabled.Store(true)
+	t.Cleanup(func() { hedgeEnabled.Store(was) })
+}
+
 // fakeConn is a net.Conn that records Close.
 type fakeConn struct {
 	gonet.Conn
@@ -175,6 +183,7 @@ func TestDialHedgedEndsWithItsContext(t *testing.T) {
 // new client to the same server; after a dial that succeeded, a slow attempt
 // is hedged again.
 func TestHedgedDialerStopsHedgingAfterAFailure(t *testing.T) {
+	withHedge(t)
 	var attempts atomic.Int32
 	var down atomic.Bool
 	down.Store(true)
@@ -213,6 +222,28 @@ func TestHedgedDialerStopsHedgingAfterAFailure(t *testing.T) {
 	t.Fatal("a successful dial did not turn hedging back on")
 }
 
+// Unless XRAY_XHTTP_DIAL_HEDGE is on, a dial makes one attempt and waits on
+// it: no second ClientHello goes out while a handshake hangs.
+func TestHedgedDialerDialsOnceByDefault(t *testing.T) {
+	was := hedgeEnabled.Load()
+	hedgeEnabled.Store(false)
+	t.Cleanup(func() { hedgeEnabled.Store(was) })
+	var attempts atomic.Int32
+	d := &hedgedDialer{history: new(dialHistory), dial: func(ctx context.Context) (gonet.Conn, error) {
+		attempts.Add(1)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	if _, err := d.Dial(ctx); err == nil {
+		t.Fatal("dial through a hung handshake succeeded")
+	}
+	if n := attempts.Load(); n != 1 {
+		t.Fatalf("%d attempts while a handshake hung, want 1", n)
+	}
+}
+
 func TestHedgeDelay(t *testing.T) {
 	for _, tc := range []struct{ last, want time.Duration }{
 		{0, time.Second},
@@ -231,6 +262,7 @@ func TestHedgeDelay(t *testing.T) {
 // as a lost or dropped handshake does, the XHTTP client gets its answer from
 // a second connection within a few seconds, not after the handshake bound.
 func Test_DialRetriesAStuckHandshake(t *testing.T) {
+	withHedge(t)
 	listenPort := tcp.PickPort()
 	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
 	streamSettings := &internet.MemoryStreamConfig{

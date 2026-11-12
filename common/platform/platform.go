@@ -24,6 +24,7 @@ const (
 	XUDPLog              = "xray.xudp.show"
 	XUDPBaseKey          = "xray.xudp.basekey"
 	XHTTPFlow            = "xray.xhttp.flow"
+	XHTTPDialHedge       = "xray.xhttp.dial.hedge"
 
 	TunFdKey = "xray.tun.fd"
 )
