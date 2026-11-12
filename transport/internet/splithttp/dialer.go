@@ -114,7 +114,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 	transportConfig := streamSettings.ProtocolSettings.(*Config)
 
-	dialOnce := func(ctxInner context.Context) (net.Conn, error) {
+	dialContext := func(ctxInner context.Context) (net.Conn, error) {
 		var conn net.Conn
 		var err error
 		if streamSettings.FinalMask != nil {
@@ -147,8 +147,6 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 		return conn, nil
 	}
-
-	dialContext := (&hedgedDialer{dial: dialOnce, history: dialHistoryOf(dest.NetAddr())}).Dial
 
 	var keepAlivePeriod time.Duration
 	if streamSettings.ProtocolSettings.(*Config).Xmux != nil {
