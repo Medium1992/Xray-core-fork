@@ -11,6 +11,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 )
@@ -174,6 +175,9 @@ func (c *UConn) ConnectionState() tls.ConnectionState {
 
 func UClient(c net.Conn, config *tls.Config, fingerprint *utls.ClientHelloID) net.Conn {
 	utlsConn := utls.UClient(c, copyConfig(config), *fingerprint)
+	if err := FixRandomizedHello(utlsConn); err != nil {
+		errors.LogInfoInner(context.Background(), err, "failed to build the ClientHello of fingerprint ", fingerprint.Str())
+	}
 	return &UConn{UConn: utlsConn}
 }
 
@@ -212,6 +216,51 @@ func copyConfig(c *tls.Config) *utls.Config {
 	return config
 }
 
+// randomizedWeights are the weights of the "randomized" and
+// "randomizednoalpn" presets, whose seed is drawn once per process. uTLS
+// offers X25519MLKEM768 in supported_groups (CurveIDs_Append_X25519) and sends
+// its key share (KeyShare_Append_RandomGroups) on two independent draws. The
+// group without its key share is turned away by REALITY and asked again by a
+// server that prefers it, which uTLS cannot answer; the key share without the
+// group breaks RFC 8446, Section 4.2.8. Both are always drawn, as current
+// browsers send them. The key share draw also adds a P-256 key share, which
+// FixRandomizedHello removes. The presets are recognized by this address.
+var randomizedWeights = func() utls.Weights {
+	weights := utls.DefaultWeights
+	weights.TLSVersMax_Set_VersionTLS13 = 1
+	weights.FirstKeyShare_Set_CurveP256 = 0
+	weights.CurveIDs_Append_X25519 = 1
+	weights.KeyShare_Append_RandomGroups = 1
+	return weights
+}()
+
+// FixRandomizedHello builds the ClientHello of a "randomized" or
+// "randomizednoalpn" client and drops its P-256 key share: X25519MLKEM768 and
+// X25519 with keys of their own is what Chrome sends, and a server that
+// wants P-256 asks for it. Other fingerprints are left as they are.
+func FixRandomizedHello(uConn *utls.UConn) error {
+	id := uConn.ClientHelloID
+	if id.Weights != &randomizedWeights {
+		return nil
+	}
+	if err := uConn.BuildHandshakeState(); err != nil {
+		return err
+	}
+	for _, extension := range uConn.Extensions {
+		if shares, ok := extension.(*utls.KeyShareExtension); ok {
+			count := len(shares.KeyShares)
+			shares.KeyShares = slices.DeleteFunc(shares.KeyShares, func(share utls.KeyShare) bool {
+				return share.Group == utls.CurveP256
+			})
+			if len(shares.KeyShares) != count {
+				return uConn.BuildHandshakeState()
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
 func init() {
 	bigInt, _ := rand.Int(rand.Reader, big.NewInt(int64(len(ModernFingerprints))))
 	stopAt := int(bigInt.Int64())
@@ -223,15 +272,12 @@ func init() {
 		}
 		i++
 	}
-	weights := utls.DefaultWeights
-	weights.TLSVersMax_Set_VersionTLS13 = 1
-	weights.FirstKeyShare_Set_CurveP256 = 0
 	randomized := utls.HelloRandomizedALPN
 	randomized.Seed, _ = utls.NewPRNGSeed()
-	randomized.Weights = &weights
+	randomized.Weights = &randomizedWeights
 	randomizednoalpn := utls.HelloRandomizedNoALPN
 	randomizednoalpn.Seed, _ = utls.NewPRNGSeed()
-	randomizednoalpn.Weights = &weights
+	randomizednoalpn.Weights = &randomizedWeights
 	PresetFingerprints["randomized"] = &randomized
 	PresetFingerprints["randomizednoalpn"] = &randomizednoalpn
 }

@@ -163,6 +163,10 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
 	{
 		uConn.BuildHandshakeState()
+		if err := tls.FixRandomizedHello(uConn.UConn); err != nil {
+			c.Close()
+			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
+		}
 		hello := uConn.HandshakeState.Hello
 		hello.SessionId = make([]byte, 32)
 		copy(hello.Raw[39:], hello.SessionId) // the fixed location of `Session ID`
