@@ -68,10 +68,16 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
 		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
 			conn = tls.UClient(pconn, tlsConfig, fingerprint)
 			if err := conn.(*tls.UConn).WebsocketHandshakeContext(ctx); err != nil {
+				conn.Close()
 				return nil, err
 			}
 		} else {
-			conn = tls.Client(pconn, tlsConfig)
+			tlsConn := tls.Client(pconn, tlsConfig).(*tls.Conn)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+			conn = tlsConn
 		}
 		requestURL.Scheme = "https"
 	} else {
