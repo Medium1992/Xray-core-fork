@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	. "github.com/xtls/xray-core/transport/internet"
 )
 
@@ -165,5 +166,42 @@ func TestDialSystemStartsNoBackupForUDP(t *testing.T) {
 	}
 	if n := d.calls.Load(); n != 1 {
 		t.Fatalf("%d dials, want 1", n)
+	}
+}
+
+// Only a proxy outbound's connect to an IP address is backed up: freedom
+// dials whatever clients ask for, and a domain is resolved and raced over
+// IPv6 and IPv4 by the system dialer itself.
+func TestDialSystemStartsNoBackupForFreedomOrADomain(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ctx  context.Context
+		dest net.Destination
+	}{
+		"freedom": {
+			session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Name: "freedom"}}),
+			tcpDest,
+		},
+		"domain": {context.Background(), net.TCPDestination(net.DomainAddress("example.com"), 443)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := &scriptedDialer{steps: []func(context.Context) (net.Conn, error){answer(&recordConn{}, 400*time.Millisecond)}}
+			useDialer(t, d)
+			if _, err := DialSystem(tc.ctx, tc.dest, nil); err != nil {
+				t.Fatal(err)
+			}
+			if n := d.calls.Load(); n != 1 {
+				t.Fatalf("%d connects, want 1", n)
+			}
+		})
+	}
+	// A proxy outbound to an IP address still gets its backup.
+	d := &scriptedDialer{steps: []func(context.Context) (net.Conn, error){answer(&recordConn{}, 400*time.Millisecond), answer(&recordConn{}, 0)}}
+	useDialer(t, d)
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Name: "vless"}})
+	if _, err := DialSystem(ctx, tcpDest, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := d.calls.Load(); n != 2 {
+		t.Fatalf("vless to an IP address: %d connects, want 2", n)
 	}
 }

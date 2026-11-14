@@ -240,7 +240,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		}
 	}
 	if sockopt == nil {
-		return systemDial(ctx, src, dest, sockopt)
+		return systemDial(ctx, src, dest, sockopt, outboundName)
 	}
 
 	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
@@ -278,13 +278,17 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
 	}
 
-	return systemDial(ctx, src, dest, sockopt)
+	return systemDial(ctx, src, dest, sockopt, outboundName)
 }
 
 // systemDial dials with the effective system dialer, backing a TCP connect up
-// as connectWithBackup does.
-func systemDial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
-	if dest.Network != net.Network_TCP {
+// as connectWithBackup does. Only a connect to an IP address by a proxy
+// outbound gets a backup: for a domain the system dialer resolves it within
+// the connect and races IPv6 and IPv4 itself, as Chrome starts no backup
+// while it resolves; and freedom dials whatever the clients ask for, where a
+// second SYN to every unreachable target would only double the SYNs.
+func systemDial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig, outboundName string) (net.Conn, error) {
+	if dest.Network != net.Network_TCP || !dest.Address.Family().IsIP() || outboundName == "freedom" {
 		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
 	}
 	return connectWithBackup(ctx, func(ctx context.Context) (net.Conn, error) {
