@@ -28,7 +28,7 @@ import (
 )
 
 // TestVlessRealityAllowX25519 connects through REALITY with a fingerprint
-// whose only key share is X25519 (edge) and with one that also sends
+// whose only key share is X25519 (helloios_14) and with one that also sends
 // X25519MLKEM768 (chrome): the X25519-only Client Hello is let in only with
 // allowX25519, the hybrid one always.
 func TestVlessRealityAllowX25519(t *testing.T) {
@@ -37,8 +37,8 @@ func TestVlessRealityAllowX25519(t *testing.T) {
 		allow       bool
 		pass        bool
 	}{
-		{"edge", false, false},
-		{"edge", true, true},
+		{"helloios_14", false, false},
+		{"helloios_14", true, true},
 		{"chrome", false, true},
 		{"chrome", true, true},
 	} {

@@ -210,6 +210,10 @@ func startRealityServer(t *testing.T, target string) *realityServer {
 		if val, _ := reality.GlobalTicketShapes.Load(key); shapeProbed {
 			_, shapeProbed = val.(*reality.TicketShape)
 		}
+		// Targets that resume are probed with a wrong binder afterwards.
+		if shape := reality.LoadTicketShape(key); shape != nil && shape.Resumes && !shape.RefusesBadBinder {
+			shapeProbed = false
+		}
 		if recordsOK && shapeProbed {
 			val, _ := reality.GlobalPostHandshakeRecordsLens.Load(key)
 			t.Logf("target records after the handshake %v, tickets %+v", val, reality.LoadTicketShape(key))
@@ -250,17 +254,36 @@ type recordCapture struct {
 	mu  sync.Mutex
 	in  []byte
 	out []byte
+	// spoilBinder flips the last byte of the ClientHello: its binder.
+	spoilBinder bool
 }
 
 func (c *recordCapture) Write(b []byte) (int, error) {
 	c.mu.Lock()
+	if c.spoilBinder && len(c.out) == 0 {
+		b = bytes.Clone(b)
+		b[len(b)-1] ^= 1
+	}
 	c.out = append(c.out, b...)
 	c.mu.Unlock()
 	return c.Conn.Write(b)
 }
 
+func (c *recordCapture) received() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return bytes.Clone(c.in)
+}
+
 // helloExtensions returns the extension types of the ClientHello sent.
 func (c *recordCapture) helloExtensions() []uint16 {
+	types, _ := c.helloExtensionLens()
+	return types
+}
+
+// helloExtensionLens returns the extension types of the ClientHello sent and
+// their lengths.
+func (c *recordCapture) helloExtensionLens() ([]uint16, []int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b := c.out[5:] // record header
@@ -270,10 +293,12 @@ func (c *recordCapture) helloExtensions() []uint16 {
 	p += 1 + int(b[p])
 	end := p + 2 + int(binary.BigEndian.Uint16(b[p:]))
 	var types []uint16
+	var lens []int
 	for p += 2; p < end; p += 4 + int(binary.BigEndian.Uint16(b[p+2:])) {
 		types = append(types, binary.BigEndian.Uint16(b[p:]))
+		lens = append(lens, int(binary.BigEndian.Uint16(b[p+2:])))
 	}
-	return types
+	return types, lens
 }
 
 func (c *recordCapture) Read(b []byte) (int, error) {
@@ -300,9 +325,10 @@ func (c *recordCapture) records() []int {
 }
 
 type dialResult struct {
-	conn    *UConn
-	records []int // up to and including the echo
-	hello   []uint16
+	conn      *UConn
+	records   []int // up to and including the echo
+	hello     []uint16
+	helloLens []int
 }
 
 func dialReality(t *testing.T, server *realityServer, browser string) dialResult {
@@ -345,7 +371,8 @@ func dialRealityAs(t *testing.T, server *realityServer, browser, fingerprint str
 	if _, err := io.ReadFull(uConn, reply); err != nil || string(reply) != "ping" {
 		t.Fatalf("echo %q: %v", reply, err)
 	}
-	return dialResult{conn: uConn, records: capture.records(), hello: capture.helloExtensions()}
+	types, lens := capture.helloExtensionLens()
+	return dialResult{conn: uConn, records: capture.records(), hello: types, helloLens: lens}
 }
 
 func testResumption(t *testing.T, target string) {
@@ -559,6 +586,14 @@ func TestResumptionHelloFollowsTheBrowser(t *testing.T) {
 		if !keepsSessionTicket && len(resumed.hello) != len(full.hello) {
 			t.Fatalf("%s: pre_shared_key takes session_ticket's place: %v, %v", fingerprint, full.hello, resumed.hello)
 		}
+		ech := func(r dialResult) int {
+			return r.helloLens[slices.Index(r.hello, 0xfe0d)]
+		}
+		// The target's tickets are 105 bytes with a SHA-256 binder: a
+		// pre_shared_key of 152 bytes, 160 rounded up.
+		if grow := ech(resumed) - ech(full); !keepsSessionTicket && grow != 160 {
+			t.Fatalf("%s: GREASE ECH grows by %d with a ticket, Firefox's by 160", fingerprint, grow)
+		}
 	}
 }
 
@@ -573,5 +608,93 @@ func TestNoTicketOfferedForAWhileAfterOneFailed(t *testing.T) {
 	store.failed["k"] = time.Now().Add(-ticketBackoff - time.Second)
 	if store.offer("k") == nil {
 		t.Fatal("tickets are offered again after the backoff, and those collected meanwhile kept")
+	}
+}
+
+// Fingerprints whose browser does not resume, such as safari, keep working
+// with browser set, with full handshakes.
+func TestBrowserWithFingerprintThatDoesNotResume(t *testing.T) {
+	server := startRealityServer(t, goTarget(t))
+	for range 2 {
+		if c := dialRealityAs(t, server, "auto", "safari"); c.conn.ConnectionState().DidResume || !c.conn.Verified {
+			t.Fatal("safari: full, verified handshakes")
+		}
+	}
+}
+
+var decryptErrorAlert = []byte{21, 3, 3, 0, 2, 2, 51}
+
+// A censor that saw a ticket on the wire offers it with a binder it cannot
+// compute. A server that issued the ticket refuses it with decrypt_error,
+// as the target refuses its own; REALITY did a full handshake, through the
+// target that does not know the ticket.
+func TestTicketWithWrongBinderIsRefused(t *testing.T) {
+	server := startRealityServer(t, opensslTarget(t))
+	dialReality(t, server, "auto")
+	key := testTicketKey(server)
+
+	// The client's own ClientHello, REALITY-authenticated, binder spoiled.
+	// OpenSSL targets give two tickets: one for each ClientHello. The
+	// failed handshake drops the client's tickets, so both are taken first.
+	session, spare := tickets.pop(key), tickets.pop(key)
+	if session == nil || spare == nil {
+		t.Fatal("no tickets")
+	}
+	tickets.push(key, session)
+	raw, err := gonet.Dial("tcp", server.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &recordCapture{Conn: raw, spoilBinder: true}
+	host, portStr, _ := gonet.SplitHostPort(server.addr)
+	port, _ := strconv.Atoi(portStr)
+	config := &Config{Fingerprint: "chrome", ServerName: testServerName, PublicKey: server.public,
+		ShortId: make([]byte, 8), SpiderY: make([]int64, 10), Browser: "auto"}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := UClient(capture, config, ctx, net.TCPDestination(net.ParseAddress(host), net.Port(port))); err == nil {
+		t.Fatal("the handshake fails")
+	} else {
+		t.Logf("client: %v", err)
+	}
+	if got := capture.received(); !bytes.Equal(got, decryptErrorAlert) {
+		t.Fatalf("authenticated, the server answers % x, want decrypt_error", got)
+	}
+
+	// The ticket in a ClientHello of the censor's own.
+	raw, err = gonet.Dial("tcp", server.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	probe := &recordCapture{Conn: raw, spoilBinder: true}
+	// InsecureSkipTimeVerify: REALITY's certificate in the session has no
+	// validity, and Go offers no ticket for an expired one.
+	uConn := utls.UClient(probe, &utls.Config{ServerName: testServerName, InsecureSkipVerify: true, InsecureSkipTimeVerify: true,
+		NextProtos: []string{"h2", "http/1.1"}, ClientSessionCache: &connTickets{key: key, conn: &UConn{}, session: spare}},
+		utls.HelloGolang)
+	uConn.SetDeadline(time.Now().Add(5 * time.Second))
+	uConn.Handshake()
+	if got := probe.received(); !bytes.Equal(got, decryptErrorAlert) {
+		t.Fatalf("not authenticated, the server answers % x, want decrypt_error", got[:min(len(got), 16)])
+	}
+}
+
+// Chromium verifies a server's certificate once in 30 minutes; meanwhile
+// full handshakes take no time for it.
+func TestVerifyDelayOncePerServer(t *testing.T) {
+	delay := verifyDelay(utls.HelloChrome_Auto, "verify-once")
+	if d := delay(); d < 15*time.Millisecond {
+		t.Fatalf("the first verification takes %v", d)
+	}
+	if d := delay(); d > time.Millisecond {
+		t.Fatalf("a cached one takes %v", d)
+	}
+	verifications.at["verify-once"] = time.Now().Add(-verifyCacheTTL - time.Second)
+	if d := delay(); d < 15*time.Millisecond {
+		t.Fatalf("after 30 minutes the certificate is verified again: %v", d)
+	}
+	if verifyDelay(utls.HelloSafari_Auto, "x") != nil {
+		t.Fatal("no delay for fingerprints not measured")
 	}
 }

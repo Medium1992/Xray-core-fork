@@ -2,6 +2,7 @@ package reality
 
 import (
 	"bytes"
+	"math/rand/v2"
 	"encoding/hex"
 	"slices"
 	"strings"
@@ -142,25 +143,56 @@ func (c *connTickets) Put(_ string, session *utls.ClientSessionState) {
 }
 
 // resumptionSpec returns the ClientHello of fingerprint as its browser
-// sends it when it offers a ticket, or nil when that is the ClientHello of
-// fingerprint plus pre_shared_key. Firefox drops the empty session_ticket
-// extension then.
-func resumptionSpec(fingerprint utls.ClientHelloID) *utls.ClientHelloSpec {
-	if fingerprint.Client != "Firefox" {
+// sends it when it offers session, or nil when that is the ClientHello of
+// fingerprint plus pre_shared_key, as with Chrome. Firefox drops the empty
+// session_ticket extension, and sizes its GREASE ECH payload as if the
+// inner ClientHello held the pre_shared_key too: it grows by the size of
+// that extension rounded up to 32 bytes (Firefox 156 and 160 captures).
+func resumptionSpec(fingerprint utls.ClientHelloID, session *utls.ClientSessionState) *utls.ClientHelloSpec {
+	if fingerprint.Client != "Firefox" || session == nil {
 		return nil
 	}
 	spec, err := utls.UTLSIdToSpec(fingerprint)
 	if err != nil {
 		return nil
 	}
+	pskLen, ok := pskExtensionLen(session)
+	if !ok {
+		return nil
+	}
 	extensions := make([]utls.TLSExtension, 0, len(spec.Extensions))
 	for _, extension := range spec.Extensions {
-		if _, ok := extension.(utls.ISessionTicketExtension); !ok {
-			extensions = append(extensions, extension)
+		switch e := extension.(type) {
+		case utls.ISessionTicketExtension:
+			continue
+		case *utls.GREASEEncryptedClientHelloExtension:
+			if len(e.CandidatePayloadLens) == 1 {
+				e.CandidatePayloadLens = []uint16{e.CandidatePayloadLens[0] + uint16((pskLen+31)/32*32)}
+			}
 		}
+		extensions = append(extensions, extension)
 	}
 	spec.Extensions = extensions
 	return &spec
+}
+
+// pskExtensionLen is the size of the pre_shared_key extension offering
+// session: type and length, the identity with its obfuscated age, and the
+// binder, as long as the hash of the session's cipher suite.
+func pskExtensionLen(session *utls.ClientSessionState) (int, bool) {
+	ticket, state, err := session.ResumptionState()
+	if err != nil || state == nil {
+		return 0, false
+	}
+	b, err := state.Bytes()
+	if err != nil || len(b) < 5 {
+		return 0, false
+	}
+	binder := 32
+	if uint16(b[3])<<8|uint16(b[4]) == utls.TLS_AES_256_GCM_SHA384 {
+		binder = 48
+	}
+	return 4 + 2 + 2 + len(ticket) + 4 + 2 + 1 + binder, true
 }
 
 // ticketKey names the tickets of one REALITY server as one outbound sees it.
@@ -221,4 +253,64 @@ func pskAAD(raw []byte, binders [][]byte) []byte {
 		clear(aad[len(aad)-n:])
 	}
 	return aad
+}
+
+// verifyDelay returns how long the browser of fingerprint takes to verify
+// a server's certificate chain, which REALITY's own check of the
+// certificate does not take: the time between the server's flight and the
+// client's Finished. Measured through REALITY in front of real sites
+// (Microsoft, Cloudflare, Yandex, GitHub, CloudFront; 4-core x86-64 Linux):
+// Chrome 157 15-48 ms, Edge 157 25-50 ms; Firefox 156 and 160 1-5 ms with
+// the stand's short chain. Chromium keeps the result for the certificate
+// for 30 minutes, and verifies again in about 1 ms meanwhile (GitHub, which
+// refuses its tickets, shows it); the first verification after a browser
+// starts takes about 125 ms and is not imitated. Resumed handshakes carry
+// no certificate and get no delay, as in the browsers.
+func verifyDelay(fingerprint utls.ClientHelloID, key string) func() time.Duration {
+	var from, to time.Duration
+	cached := false
+	switch fingerprint.Client {
+	case "Chrome":
+		from, to, cached = 15*time.Millisecond, 48*time.Millisecond, true
+	case "Edge":
+		from, to, cached = 25*time.Millisecond, 50*time.Millisecond, true
+	case "Firefox":
+		from, to = 1*time.Millisecond, 5*time.Millisecond
+	default:
+		return nil
+	}
+	return func() time.Duration {
+		if cached && !verifications.fresh(key) {
+			return time.Millisecond
+		}
+		return from + time.Duration(rand.Int64N(int64(to-from)))
+	}
+}
+
+// verifyCacheTTL is how long Chromium keeps a certificate's verification.
+const verifyCacheTTL = 30 * time.Minute
+
+var verifications = &verifyCache{at: make(map[string]time.Time)}
+
+// verifyCache remembers when a server's certificate was last verified.
+type verifyCache struct {
+	sync.Mutex
+	at map[string]time.Time
+}
+
+// fresh reports whether the certificate of the server named key needs a
+// verification, a fresh one, and notes that it has one now.
+func (v *verifyCache) fresh(key string) bool {
+	v.Lock()
+	defer v.Unlock()
+	now := time.Now()
+	last, ok := v.at[key]
+	if !ok || now.Sub(last) > verifyCacheTTL {
+		if len(v.at) >= ticketServers {
+			clear(v.at)
+		}
+		v.at[key] = now
+		return true
+	}
+	return false
 }

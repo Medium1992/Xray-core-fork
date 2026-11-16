@@ -164,6 +164,15 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	var ticketsKey string
 	var cache *connTickets
 	if browser {
+		if delay := verifyDelay(*fingerprint, ticketKey(config, dest, utlsConfig.ServerName)); delay != nil {
+			utlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
+				err := uConn.VerifyPeerCertificate(rawCerts, chains)
+				if err == nil && uConn.Verified {
+					time.Sleep(delay())
+				}
+				return err
+			}
+		}
 		ticketsKey = ticketKey(config, dest, utlsConfig.ServerName)
 		cache = &connTickets{key: ticketsKey, conn: uConn, session: tickets.offer(ticketsKey)}
 		utlsConfig.SessionTicketsDisabled = false
@@ -174,7 +183,11 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	}
 	// uTLS takes the ticket from the cache when it builds the ClientHello.
 	offered := cache != nil && cache.session != nil
-	if spec := resumptionSpec(*fingerprint); offered && spec != nil {
+	var spec *utls.ClientHelloSpec
+	if offered {
+		spec = resumptionSpec(*fingerprint, cache.session)
+	}
+	if spec != nil {
 		uConn.UConn = utls.UClient(c, utlsConfig, utls.HelloCustom)
 		if err := uConn.ApplyPreset(spec); err != nil {
 			c.Close()
