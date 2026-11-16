@@ -1,0 +1,6 @@
+<html><body>stand<script>
+// The target closes idle connections after 2 s, so these come over new
+// connections that resume the session.
+setTimeout(() => fetch('/index.html?2'), 4000);
+setTimeout(() => fetch('/index.html?3'), 8000);
+</script></body></html>

@@ -1,0 +1,31 @@
+user root root;
+worker_processes 1;
+pid @WORK@/runs/nginx.pid;
+error_log @WORK@/runs/nginx-error.log warn;
+events { worker_connections 256; }
+http {
+  access_log off;
+  client_body_temp_path @WORK@/runs/nginx-tmp/body;
+  proxy_temp_path @WORK@/runs/nginx-tmp/proxy;
+  fastcgi_temp_path @WORK@/runs/nginx-tmp/fastcgi;
+  uwsgi_temp_path @WORK@/runs/nginx-tmp/uwsgi;
+  scgi_temp_path @WORK@/runs/nginx-tmp/scgi;
+  keepalive_timeout 2s;
+  server {
+    listen 10.9.0.11:443 ssl;
+    http2 on;
+    server_name nginx.example.test;
+    ssl_certificate @WORK@/certs/chain.pem;
+    ssl_certificate_key @WORK@/certs/site.key;
+    root @WORK@/www;
+  }
+  server {
+    listen 10.9.0.14:443 ssl;
+    http2 on;
+    server_name nginxshort.example.test;
+    ssl_certificate @WORK@/certs/chain.pem;
+    ssl_certificate_key @WORK@/certs/site.key;
+    ssl_session_timeout 8s;
+    root @WORK@/www;
+  }
+}
