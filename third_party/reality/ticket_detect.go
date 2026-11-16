@@ -24,9 +24,24 @@ var GlobalTicketShapes sync.Map
 
 // TicketShape is what an observer sees of the target's session tickets.
 type TicketShape struct {
-	// Resumes reports that the target issues tickets and accepts them back.
-	// The other fields are meaningful only when it is true.
+	// Issues reports that the target issues tickets; the fields about them
+	// are meaningful only when it is true. Resumes reports that it accepts
+	// them back too, and the fields about resumed handshakes are meaningful
+	// only then. Some targets issue tickets they never accept (servers
+	// behind a load balancer without shared ticket keys): REALITY's then
+	// carry nothing and are refused the same way.
+	Issues  bool
 	Resumes bool
+
+	// FlightRecords is how many records carry the encrypted part of the
+	// server's flight: 4, one per message (OpenSSL, crypto/tls), or 1
+	// (BoringSSL). A resumed flight then has 2 records or 1.
+	FlightRecords int
+	// TicketsPerRecord and ResTicketsPerRecord are how many tickets share
+	// the first record after the client's Finished, after a full and after
+	// a resumed handshake: 1, or all of them (BoringSSL).
+	TicketsPerRecord    int
+	ResTicketsPerRecord int
 
 	// TicketLen and ResTicketLen are the lengths of the target's tickets
 	// after a full and after a resumed handshake, as clients send them back
@@ -63,8 +78,36 @@ type TicketShape struct {
 	ResRecords []int
 	// ResTickets is the number of tickets after a resumed handshake.
 	ResTickets int
+	// BadBinder is what the target sends back to one of its tickets
+	// offered with a wrong binder, alerts such as decrypt_error, after
+	// BadBinderDelay (CloudFront waits about 25 s; nothing at all when
+	// BadBinder is empty and the delay set). RefusesBadBinder is false when
+	// the target does not refuse so, or until its probe, which runs after
+	// the rest, ends.
+	RefusesBadBinder bool
+	BadBinder        []byte
+	BadBinderDelay   time.Duration
 
-	probed time.Time
+	probed           time.Time
+	badBinderSession *utls.ClientSessionState
+}
+
+// storeTicketShape stores shape for key, then probes how the target refuses
+// a wrong binder, which may take long, and stores the shape again with it.
+func storeTicketShape(config *Config, key, sni string, alpn int, shape *TicketShape) {
+	shape.probed = time.Now()
+	GlobalTicketShapes.Store(key, shape)
+	if !shape.Resumes || shape.badBinderSession == nil {
+		return
+	}
+	answer, delay, ok := probeBadBinder(config, sni, alpn, shape.badBinderSession)
+	if !ok {
+		return
+	}
+	refusing := *shape
+	refusing.RefusesBadBinder, refusing.BadBinder, refusing.BadBinderDelay = true, answer, delay
+	refusing.badBinderSession = nil
+	GlobalTicketShapes.CompareAndSwap(key, shape, &refusing)
 }
 
 // ticketRecordOverhead is what a TLS 1.3 record holding a NewSessionTicket
@@ -91,8 +134,7 @@ func DetectTicketShape(config *Config, key, sni string, alpn int) {
 		if shape == nil {
 			shape = &TicketShape{}
 		}
-		shape.probed = time.Now()
-		GlobalTicketShapes.Store(key, shape)
+		storeTicketShape(config, key, sni, alpn, shape)
 	}()
 }
 
@@ -121,20 +163,19 @@ func RefreshTicketShape(config *Config, key, sni string, alpn int) {
 			again := *shape
 			fresh = &again
 		}
-		fresh.probed = time.Now()
-		GlobalTicketShapes.Store(key, fresh)
+		storeTicketShape(config, key, sni, alpn, fresh)
 	}()
 }
 
 // LoadTicketShape returns the shape probed for key, or nil while the probe
-// runs or when the target does not resume.
+// runs or when the target issues no tickets.
 func LoadTicketShape(key string) *TicketShape {
 	val, ok := GlobalTicketShapes.Load(key)
 	if !ok {
 		return nil
 	}
 	shape, ok := val.(*TicketShape)
-	if !ok || !shape.Resumes {
+	if !ok || !shape.Issues {
 		return nil
 	}
 	return shape
@@ -174,13 +215,17 @@ func (r *ticketRecorder) take() []*utls.ClientSessionState {
 // probeCaptureConn records what the target sends.
 type probeCaptureConn struct {
 	net.Conn
-	mu sync.Mutex
-	in []byte
+	mu        sync.Mutex
+	in        []byte
+	firstByte time.Time
 }
 
 func (c *probeCaptureConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	c.mu.Lock()
+	if n > 0 && c.firstByte.IsZero() {
+		c.firstByte = time.Now()
+	}
 	c.in = append(c.in, b[:n]...)
 	c.mu.Unlock()
 	return n, err
@@ -256,12 +301,15 @@ func probeOnce(config *Config, sni string, alpn int, replay *utls.ClientSessionS
 	case 2:
 		nextProtos = []string{"h2", "http/1.1"}
 	}
-	uConn := utls.UClient(capture, &utls.Config{
+	uConn, err := probeClient(capture, &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
 		NextProtos:         nextProtos,
 		ClientSessionCache: recorder,
-	}, utls.HelloGolang)
+	}, alpn, replay != nil)
+	if err != nil {
+		return nil, err
+	}
 	if err = uConn.Handshake(); err != nil {
 		return nil, err
 	}
@@ -296,29 +344,32 @@ func probeTicketShape(config *Config, sni string, alpn int) (*TicketShape, error
 	if len(full.sessions) == 0 {
 		return nil, errors.New("reality: the target issues no tickets")
 	}
+	shape := &TicketShape{
+		Tickets:     len(full.sessions),
+		FullRecords: recordLens(full.records),
+	}
+	switch {
+	case len(shape.FullRecords) >= 5 && shape.FullRecords[0] <= 512:
+		shape.FlightRecords = 4
+	case len(shape.FullRecords) >= 2 && shape.FullRecords[0] > 512:
+		shape.FlightRecords = 1
+	default:
+		return nil, errors.New("reality: unsupported handshake records")
+	}
+	sessions := full.sessions
 	res, err := probeOnce(config, sni, alpn, full.sessions[0])
 	if err != nil {
 		return nil, err
 	}
-	if !res.resumed {
-		return nil, errors.New("reality: the target does not resume its own ticket")
-	}
-
-	shape := &TicketShape{
-		Tickets:     len(full.sessions),
-		ResTickets:  len(res.sessions),
-		FullRecords: recordLens(full.records),
-		ResRecords:  recordLens(res.records),
-		HelloDelta:  res.hello.len() - full.hello.len(),
-	}
-	// One record per handshake message: the Finished of a full handshake
-	// is its fourth record, that of a resumed one its second.
-	if len(shape.FullRecords) < 4 || len(shape.ResRecords) < 2+shape.ResTickets ||
-		shape.FullRecords[3] != shape.ResRecords[1] {
-		return nil, errors.New("reality: unsupported handshake records")
+	sessions = append(sessions, res.sessions...)
+	if len(sessions) < 2 {
+		// one more ticket shows what all of them start with
+		if again, err := probeOnce(config, sni, alpn, nil); err == nil {
+			sessions = append(sessions, again.sessions...)
+		}
 	}
 	var tickets [][]byte
-	for _, cs := range append(full.sessions, res.sessions...) {
+	for _, cs := range sessions {
 		ticket, state, err := cs.ResumptionState()
 		if err != nil || state == nil {
 			return nil, errors.New("reality: unreadable ticket")
@@ -328,30 +379,86 @@ func probeTicketShape(config *Config, sni string, alpn int) (*TicketShape, error
 			shape.Lifetime = lifetime
 		}
 	}
-	shape.TicketLen = len(tickets[0])
-	shape.ResTicketLen = shape.TicketLen
-	if len(res.sessions) != 0 {
-		shape.ResTicketLen = len(tickets[len(full.sessions)])
-	}
-	shape.Prefix = commonPrefix(tickets)
-	// The first record after the Finished of the full handshake is its
-	// first ticket.
-	if len(shape.FullRecords) < 5 {
-		return nil, errors.New("reality: tickets not where expected")
-	}
-	shape.NonceLen = shape.FullRecords[4] - ticketRecordOverhead - shape.TicketLen
-	if shape.NonceLen < 0 || shape.NonceLen > 255 {
-		return nil, errors.New("reality: tickets not where expected")
-	}
-
-	if shape.PSKIndex, err = pskExtensionIndex(res.hello.body); err != nil {
-		return nil, err
-	}
 	if shape.Lifetime == 0 {
 		return nil, errors.New("reality: no ticket lifetime")
 	}
-	shape.Resumes = true
+	shape.TicketLen = len(tickets[0])
+	shape.Prefix = commonPrefix(tickets)
+	shortest := shape.TicketLen
+	for _, ticket := range tickets {
+		shortest = min(shortest, len(ticket))
+	}
+	if shape.TicketsPerRecord, shape.NonceLen, err = ticketLayout(shape.FullRecords[shape.FlightRecords:],
+		shape.Tickets, shape.TicketLen, shortest); err != nil {
+		return nil, err
+	}
+	shape.Issues = true
+
+	if res.resumed {
+		shape.ResTickets = len(res.sessions)
+		shape.ResRecords = recordLens(res.records)
+		shape.HelloDelta = res.hello.len() - full.hello.len()
+		shape.ResTicketLen = shape.TicketLen
+		if len(res.sessions) != 0 {
+			shape.ResTicketLen = len(tickets[len(full.sessions)])
+		}
+		resFlight, ok := 1, len(shape.ResRecords) >= 1 && shape.ResRecords[0] <= 512
+		if shape.FlightRecords == 4 {
+			// the Finished of a full handshake is its fourth record, that
+			// of a resumed one its second
+			resFlight, ok = 2, len(shape.ResRecords) >= 2 && shape.FullRecords[3] == shape.ResRecords[1]
+		}
+		if !ok {
+			return nil, errors.New("reality: unsupported resumed handshake records")
+		}
+		if shape.ResTickets != 0 {
+			// A ticket sent with the flight (crypto/tls) is the first of
+			// these; the target's live answer shows which it is.
+			post := shape.ResRecords[resFlight:]
+			if shape.ResTicketsPerRecord, _, err = ticketLayout(post, shape.ResTickets, shape.ResTicketLen, shortest); err != nil {
+				return nil, err
+			}
+		}
+		if shape.PSKIndex, err = pskExtensionIndex(res.hello.body); err != nil {
+			return nil, err
+		}
+		shape.Resumes = true
+	}
+	shape.badBinderSession = full.sessions[0]
 	return shape, nil
+}
+
+// ticketLayout tells, from the records after the client's Finished, how
+// many tickets the first of them holds and the length of their nonce: one
+// ticket per record when enough records can hold one, else all in the
+// first (BoringSSL).
+//
+// ticketLen is the length of the first ticket, the first record's; the
+// lengths of a target's tickets vary (OpenSSL's by 16 bytes), so whether a
+// record can hold one is judged by the shortest, shortest.
+func ticketLayout(post []int, tickets, ticketLen, shortest int) (perRecord, nonceLen int, err error) {
+	fit := 0
+	for _, l := range post {
+		if l >= shortest+ticketRecordOverhead {
+			fit++
+		}
+	}
+	perRecord = 1
+	if fit < tickets {
+		perRecord = tickets
+	}
+	if len(post) == 0 {
+		return 0, 0, errors.New("reality: tickets not where expected")
+	}
+	body := post[0] - (ticketRecordOverhead - (4 + 4 + 4 + 1 + 2 + 2)) // record header, tag, content type
+	if body%perRecord != 0 {
+		return 0, 0, errors.New("reality: tickets not where expected")
+	}
+	nonceLen = body/perRecord - (4 + 4 + 4 + 1 + 2 + 2) - ticketLen
+	if nonceLen < 0 || nonceLen > 255 {
+		return 0, 0, errors.New("reality: tickets not where expected")
+	}
+	return perRecord, nonceLen, nil
 }
 
 // ticketLifetime reads the lifetime a client session was given from its
@@ -434,4 +541,105 @@ func serverHelloExtensions(msg []byte) (offset int, types []uint16, err error) {
 func serverHelloExtensionTypes(msg []byte) ([]uint16, error) {
 	_, types, err := serverHelloExtensions(msg)
 	return types, err
+}
+
+// binderSpoiler flips the last byte of the first record it writes: the end
+// of the binders of a ClientHello that offers a ticket.
+type binderSpoiler struct {
+	net.Conn
+	done bool
+}
+
+func (c *binderSpoiler) Write(b []byte) (int, error) {
+	if !c.done && len(b) > 0 && b[0] == byte(recordTypeHandshake) {
+		c.done = true
+		b = bytes.Clone(b)
+		b[len(b)-1] ^= 1
+	}
+	return c.Conn.Write(b)
+}
+
+// badBinderWait is how long the probe of a wrong binder waits for the
+// target's answer.
+const badBinderWait = 40 * time.Second
+
+// probeBadBinder offers the target its own ticket with a wrong binder and
+// returns what it sends back and after how long, if that is alerts or
+// nothing at all, as a server that issued the ticket answers; ok is false
+// when the target goes on with the handshake instead.
+func probeBadBinder(config *Config, sni string, alpn int, session *utls.ClientSessionState) (answer []byte, delay time.Duration, ok bool) {
+	dial := config.DialContext
+	if dial == nil {
+		dial = new(net.Dialer).DialContext
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ticketProbeTimeout)
+	defer cancel()
+	target, err := dial(ctx, config.Type, config.Dest)
+	if err != nil {
+		return nil, 0, false
+	}
+	defer target.Close()
+	if config.Xver == 1 || config.Xver == 2 {
+		if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
+			return nil, 0, false
+		}
+	}
+	capture := &probeCaptureConn{Conn: target}
+	var nextProtos []string
+	switch alpn {
+	case 1:
+		nextProtos = []string{"http/1.1"}
+	case 2:
+		nextProtos = []string{"h2", "http/1.1"}
+	}
+	start := time.Now()
+	target.SetDeadline(start.Add(badBinderWait))
+	uConn := utls.UClient(&binderSpoiler{Conn: capture}, &utls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+		NextProtos:         nextProtos,
+		ClientSessionCache: &ticketRecorder{replay: session},
+	}, utls.HelloGolang)
+	uConn.Handshake()
+	delay = capture.firstByte.Sub(start)
+	answer = capture.received()
+	if len(answer) == 0 {
+		return nil, badBinderWait, true
+	}
+	records := splitRecords(answer)
+	n := 0
+	for _, r := range records {
+		if r.typ != byte(recordTypeAlert) {
+			return nil, 0, false
+		}
+		n += r.len()
+	}
+	if delay < time.Second {
+		delay = 0 // an answer right away, but for the round trip
+	}
+	return answer[:n], delay, n > 0
+}
+
+// probeClient returns the client of a probe: Chrome's ClientHello for the
+// h2 key, as browsers send it there (a target may pick its certificate, and
+// what it answers in EncryptedExtensions, by the ClientHello: Cloudflare
+// sends Chrome an ECDSA chain, Go an RSA one), and Go's for the others,
+// with pre_shared_key when it offers a ticket.
+func probeClient(conn net.Conn, config *utls.Config, alpn int, offer bool) (*utls.UConn, error) {
+	if alpn != 2 {
+		return utls.UClient(conn, config, utls.HelloGolang), nil
+	}
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		return nil, err
+	}
+	if offer {
+		spec.Extensions = append(spec.Extensions, &utls.UtlsPreSharedKeyExtension{})
+		config.OmitEmptyPsk = true // the ticket comes when the ClientHello is built
+	}
+	uConn := utls.UClient(conn, config, utls.HelloCustom)
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		return nil, err
+	}
+	return uConn, nil
 }

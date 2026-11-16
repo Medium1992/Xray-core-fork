@@ -1,6 +1,7 @@
 package reality
 
 import (
+	"bytes"
 	"fmt"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -173,6 +174,9 @@ func TestProbeTicketShapeGoTarget(t *testing.T) {
 	if !shape.Resumes || shape.Tickets != 1 || shape.ResTickets != 1 {
 		t.Fatalf("crypto/tls issues one ticket per handshake: %+v", shape)
 	}
+	if answer, delay, ok := probeBadBinder(config, "example.com", 2, shape.badBinderSession); !ok || delay != 0 || !bytes.Equal(answer, decryptErrorAlert) {
+		t.Fatalf("crypto/tls refuses a wrong binder with decrypt_error at once: %x after %v", answer, delay)
+	}
 	if shape.HelloDelta != 6 || shape.Lifetime != 7*24*3600 {
 		t.Fatalf("ServerHello delta %d, lifetime %d", shape.HelloDelta, shape.Lifetime)
 	}
@@ -193,6 +197,9 @@ func TestProbeTicketShapeOpenSSLTarget(t *testing.T) {
 	}
 	if shape.HelloDelta != 6 {
 		t.Fatalf("ServerHello delta %d", shape.HelloDelta)
+	}
+	if answer, delay, ok := probeBadBinder(config, "example.com", 2, shape.badBinderSession); !ok || delay != 0 || !bytes.Equal(answer, decryptErrorAlert) {
+		t.Fatalf("OpenSSL refuses a wrong binder with decrypt_error at once: %x after %v", answer, delay)
 	}
 	if len(shape.Prefix) < 16 {
 		t.Fatalf("OpenSSL tickets start with a 16-byte key name, prefix %x", shape.Prefix)
@@ -260,3 +267,6 @@ func TestTicketShapeIsProbedAgain(t *testing.T) {
 		t.Fatal("the target resumes")
 	}
 }
+
+// decryptErrorAlert is a plaintext TLS alert record: fatal, decrypt_error.
+var decryptErrorAlert = []byte{21, 3, 3, 0, 2, 2, 51}

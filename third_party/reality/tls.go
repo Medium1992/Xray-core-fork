@@ -263,6 +263,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					_, err = aead.Open(plainText[:0], hs.clientHello.random[20:], ciphertext, pskAAD(hs.clientHello.original, hs.clientHello.pskBinders))
 				}
 				if err != nil {
+					copy(hs.clientHello.sessionId, ciphertext)
 					break
 				}
 				copy(hs.clientHello.sessionId, ciphertext)
@@ -288,7 +289,33 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			break
 		}
+		if hs.clientHello != nil && hs.c.vers == VersionTLS13 && config.ServerNames[hs.clientHello.serverName] {
+			hs.refusal = hs.ticketRefusal()
+		}
 		mutex.Unlock()
+		if hs.refusal != nil {
+			// One of REALITY's tickets with a wrong binder: refuse it as
+			// the target refuses its own, whoever sends it, after as long.
+			if config.Show {
+				fmt.Printf("REALITY remoteAddr: %v\trefused a ticket with a wrong binder: % x after %v\n", remoteAddr, hs.refusal.BadBinder, hs.refusal.BadBinderDelay)
+			}
+			target.Close()
+			if hs.refusal.BadBinderDelay > 0 {
+				conn.SetReadDeadline(time.Now().Add(hs.refusal.BadBinderDelay))
+				io.Copy(io.Discard, underlying) // until then, or until the client goes
+				conn.SetReadDeadline(time.Time{})
+			}
+			// Close as a server that sends an alert does: FIN after it,
+			// then whatever the client still sends, so that no reset
+			// takes the alert with it.
+			conn.Write(hs.refusal.BadBinder)
+			underlying.CloseWrite()
+			conn.SetReadDeadline(time.Now().Add(time.Second))
+			io.Copy(io.Discard, underlying)
+			conn.Close()
+			waitGroup.Done()
+			return
+		}
 		if hs.c.conn != conn {
 			if config.Show && hs.clientHello != nil {
 				fmt.Printf("REALITY remoteAddr: %v\tforwarded SNI: %v\n", remoteAddr, hs.clientHello.serverName)
@@ -318,13 +345,23 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			n, err := target.Read(buf)
 			if n == 0 {
 				if err != nil {
-					conn.Close()
+					mutex.Lock()
+					refused := hs.refusal != nil // the other side answers the client then
+					mutex.Unlock()
+					if !refused {
+						conn.Close()
+					}
 					waitGroup.Done()
 					return
 				}
 				continue
 			}
 			mutex.Lock()
+			if hs.refusal != nil {
+				mutex.Unlock()
+				waitGroup.Done()
+				return
+			}
 			s2cSaved = append(s2cSaved, buf[:n]...)
 			if hs.c.conn != conn {
 				copying = true // if the target already sent some data, just start bidirectional direct forwarding
@@ -419,9 +456,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					if postHandshakeRecordsLens, ok := val.([]int); ok {
 						lens, tickets := hs.postHandshakeRecords(postHandshakeRecordsLens)
 						for i, length := range lens {
-							if i < tickets {
-								if msg := hs.c.realityTicketMsg(hs.ticketShape, length); msg != nil {
-									hs.c.writeTicketRecord(msg, length)
+							if tickets[i] > 0 {
+								if msgs := hs.c.ticketMsgs(hs.ticketShape, length, tickets[i]); msgs != nil {
+									hs.c.writeTicketRecord(msgs, length)
 									if config.Show {
 										fmt.Printf("REALITY remoteAddr: %v\tlen(NewSessionTicket record): %v\n", remoteAddr, length)
 									}

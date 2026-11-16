@@ -69,28 +69,64 @@ func (c *Config) realityTicketKeys() []ticketKey {
 	return []ticketKey{c.ticketKeyFromBytes([32]byte(secret))}
 }
 
-// realityTicketMsg returns a NewSessionTicket that fills a record of
-// recordLen bytes as the target's does: a nonce as long as the target's and
-// the ticket taking the rest, or nil if it cannot.
-func (c *Conn) realityTicketMsg(shape *TicketShape, recordLen int) []byte {
+// ticketMsgs returns n NewSessionTickets that together fill a record
+// of recordLen bytes as the target's do: nonces as long as the target's and
+// the tickets taking the rest, or nil if they cannot. For a target that
+// never accepts its tickets back, REALITY's carry random bytes it never
+// accepts either.
+func (c *Conn) ticketMsgs(shape *TicketShape, recordLen, n int) [][]byte {
 	suite := cipherSuiteTLS13ByID(c.cipherSuite)
 	keys := c.config.realityTicketKeys()
-	if _, ok := c.out.cipher.(aead); suite == nil || !ok || c.resumptionSecret == nil || keys == nil {
+	if _, ok := c.out.cipher.(aead); suite == nil || !ok || c.resumptionSecret == nil || keys == nil || n < 1 {
 		return nil
 	}
-	ticketLen := recordLen - ticketRecordOverhead - shape.NonceLen
-	if ticketLen < len(shape.Prefix) {
+	const fixed = 4 + 4 + 4 + 1 + 2 + 2 // type, length, lifetime, age_add, length prefixes
+	room := (recordLen - recordHeaderLen - c.out.cipher.(aead).Overhead() - 1) / n
+	ticketLen := room - fixed - shape.NonceLen
+	if ticketLen < len(shape.Prefix)+1 {
 		return nil
 	}
-	nonce := make([]byte, shape.NonceLen)
-	ageAdd := make([]byte, 4)
-	if _, err := io.ReadFull(c.config.rand(), nonce); err != nil {
-		return nil
+	msgs := make([][]byte, 0, n)
+	for range n {
+		nonce := make([]byte, shape.NonceLen)
+		ageAdd := make([]byte, 4)
+		if _, err := io.ReadFull(c.config.rand(), nonce); err != nil {
+			return nil
+		}
+		if _, err := io.ReadFull(c.config.rand(), ageAdd); err != nil {
+			return nil
+		}
+		var label []byte
+		if shape.Resumes {
+			label = c.realityTicketLabel(suite, keys, shape.Prefix, nonce, ticketLen)
+		} else {
+			label = make([]byte, ticketLen)
+			copy(label, shape.Prefix)
+			if _, err := io.ReadFull(c.config.rand(), label[len(shape.Prefix):]); err != nil {
+				return nil
+			}
+		}
+		if label == nil {
+			return nil
+		}
+		m := &newSessionTicketMsgTLS13{
+			lifetime: shape.Lifetime,
+			ageAdd:   binary.LittleEndian.Uint32(ageAdd),
+			nonce:    nonce,
+			label:    label,
+		}
+		msg, err := m.marshal()
+		if err != nil {
+			return nil
+		}
+		msgs = append(msgs, msg)
 	}
-	if _, err := io.ReadFull(c.config.rand(), ageAdd); err != nil {
-		return nil
-	}
+	return msgs
+}
 
+// realityTicketLabel returns a ticket of ticketLen bytes for this
+// connection's session, sealed with REALITY's ticket key behind prefix.
+func (c *Conn) realityTicketLabel(suite *cipherSuiteTLS13, keys []ticketKey, prefix, nonce []byte, ticketLen int) []byte {
 	state := c.sessionState()
 	state.secret = tls13.ExpandLabel(suite.hash.New, c.resumptionSecret, "resumption", nonce, suite.hash.Size())
 	// An Extra entry pads the encrypted state to the length of the
@@ -99,7 +135,7 @@ func (c *Conn) realityTicketMsg(shape *TicketShape, recordLen int) []byte {
 	if err != nil {
 		return nil
 	}
-	sealed := ticketLen - len(shape.Prefix)
+	sealed := ticketLen - len(prefix)
 	if pad := sealed - aes.BlockSize - sha256.Size - len(base); pad >= 3 {
 		state.Extra = [][]byte{make([]byte, pad-3)}
 	} else if pad != 0 {
@@ -113,32 +149,24 @@ func (c *Conn) realityTicketMsg(shape *TicketShape, recordLen int) []byte {
 	if err != nil {
 		return nil
 	}
-	m := &newSessionTicketMsgTLS13{
-		lifetime: shape.Lifetime,
-		ageAdd:   binary.LittleEndian.Uint32(ageAdd),
-		nonce:    nonce,
-		label:    append(bytes.Clone(shape.Prefix), ticket...),
-	}
-	msg, err := m.marshal()
-	if err != nil {
-		return nil
-	}
-	return msg
+	return append(bytes.Clone(prefix), ticket...)
 }
 
-// writeTicketRecord writes msg as a handshake record of length bytes, after
-// the handshake, the way the empty records of the target's lengths are.
-func (c *Conn) writeTicketRecord(msg []byte, length int) error {
+// writeTicketRecord writes msgs as one handshake record of length bytes,
+// after the handshake, the way the empty records of the target's lengths
+// are.
+func (c *Conn) writeTicketRecord(msgs [][]byte, length int) error {
 	plainText := make([]byte, length-c.out.cipher.(aead).Overhead())
-	if len(plainText) < recordHeaderLen+len(msg)+1 {
-		return errors.New("reality: ticket does not fit its record")
+	content := bytes.Join(msgs, nil)
+	if len(plainText) < recordHeaderLen+len(content)+1 {
+		return errors.New("reality: tickets do not fit their record")
 	}
 	plainText[0] = byte(recordTypeApplicationData)
 	plainText[1] = 3
 	plainText[2] = 3
 	binary.BigEndian.PutUint16(plainText[3:], uint16(length-recordHeaderLen))
-	copy(plainText[recordHeaderLen:], msg)
-	plainText[recordHeaderLen+len(msg)] = byte(recordTypeHandshake)
+	copy(plainText[recordHeaderLen:], content)
+	plainText[recordHeaderLen+len(content)] = byte(recordTypeHandshake)
 	record := c.out.cipher.(aead).Seal(plainText[:recordHeaderLen], c.out.seq[:], plainText[recordHeaderLen:], plainText[:recordHeaderLen])
 	c.out.incSeq()
 	_, err := c.write(record)
@@ -157,41 +185,36 @@ func (hs *serverHandshakeStateTLS13) realityResume(shape *TicketShape) bool {
 		len(ch.pskIdentities) != len(ch.pskBinders) {
 		return false
 	}
-	// Only targets that send one record per handshake message.
-	if c.out.handshakeBuf != nil || c.out.handshakeLen[2] == 0 || c.out.handshakeLen[5] == 0 {
+	if !shape.Resumes {
 		return false
 	}
-	label := ch.pskIdentities[0].label
-	if !bytes.HasPrefix(label, shape.Prefix) {
+	// The target's live answer has the flight its probe had.
+	if (shape.FlightRecords == 1) != (c.out.handshakeBuf != nil) || c.out.handshakeLen[2] == 0 {
 		return false
 	}
-	plaintext := c.config.decryptTicket(label[len(shape.Prefix):], c.config.realityTicketKeys())
-	if plaintext == nil {
-		return false
-	}
-	session, err := ParseSessionState(plaintext)
-	if err != nil || session.version != VersionTLS13 || session.isClient {
-		return false
-	}
-	age := c.config.time().Sub(time.Unix(int64(session.createdAt), 0))
-	if age < -time.Minute || age > time.Duration(shape.Lifetime)*time.Second {
+	session := c.config.realityTicketSession(shape, ch.pskIdentities[0].label)
+	if session == nil {
 		return false
 	}
 	pskSuite := cipherSuiteTLS13ByID(session.cipherSuite)
 	if pskSuite == nil || pskSuite.hash != hs.suite.hash {
 		return false
 	}
-	earlySecret := tls13.NewEarlySecret(hs.suite.hash.New, session.secret)
-	transcript := hs.suite.hash.New()
-	helloBytes, err := ch.marshalWithoutBinders()
-	if err != nil {
+	earlySecret, ok := checkBinder(pskSuite, session, ch)
+	if !ok {
 		return false
 	}
-	transcript.Write(helloBytes)
-	if !hmac.Equal(ch.pskBinders[0], hs.suite.finishedHash(earlySecret.ResumptionBinderKey(), transcript)) {
-		return false
-	}
+	// EncryptedExtensions changes as the target's does: by as much as in
+	// the probe, from the target's live answer to this ClientHello, which
+	// may carry more (BoringSSL answers Chrome's ALPS in it). In a flight
+	// of one record it shares it with the rest of the flight: what goes is
+	// the certificate.
 	ee := c.out.handshakeLen[2] + shape.ResRecords[0] - shape.FullRecords[0]
+	if live := c.out.handshakeLen[2]; shape.FlightRecords == 1 && live-shape.FullRecords[0] >= -3 && live-shape.FullRecords[0] <= 3 {
+		// The same answer as the probe's but for the signature, whose
+		// length varies and which a resumed flight does not carry.
+		ee = shape.ResRecords[0]
+	}
 	if ee <= recordHeaderLen {
 		return false
 	}
@@ -209,7 +232,7 @@ func (hs *serverHandshakeStateTLS13) realityResume(shape *TicketShape) bool {
 	c.out.handshakeLen[2] = ee
 	c.out.handshakeLen[3] = 0
 	c.out.handshakeLen[4] = 0
-	if c.out.handshakeLen[6] != 0 && len(shape.ResRecords) > 2 {
+	if c.out.handshakeLen[6] != 0 && shape.FlightRecords == 4 && len(shape.ResRecords) > 2 {
 		c.out.handshakeLen[6] = shape.ResRecords[2]
 	}
 	return true
@@ -241,19 +264,99 @@ func insertPSKExtension(hello []byte, index int) ([]byte, error) {
 }
 
 // postHandshakeRecords returns the records to send after the client's
-// Finished, given the target's after a full handshake, and how many of the
-// first of them are tickets.
-func (hs *serverHandshakeStateTLS13) postHandshakeRecords(lens []int) ([]int, int) {
+// Finished, given the target's after a full handshake, and how many
+// tickets each of them carries.
+func (hs *serverHandshakeStateTLS13) postHandshakeRecords(lens []int) ([]int, []int) {
 	shape := hs.ticketShape
+	tickets := make([]int, len(lens))
 	if shape == nil {
-		return lens, 0
+		return lens, tickets
 	}
 	inFlight := 0
 	if hs.ticketInFlight {
 		inFlight = 1
 	}
+	total, perRecord := shape.Tickets-inFlight, shape.TicketsPerRecord
 	if hs.usingPSK {
-		return shape.ResRecords[min(2+inFlight, len(shape.ResRecords)):], max(shape.ResTickets-inFlight, 0)
+		flight := 2 + inFlight
+		if shape.FlightRecords == 1 {
+			flight = 1
+		}
+		lens = shape.ResRecords[min(flight, len(shape.ResRecords)):]
+		tickets = make([]int, len(lens))
+		total, perRecord = shape.ResTickets-inFlight, shape.ResTicketsPerRecord
 	}
-	return lens, max(shape.Tickets-inFlight, 0)
+	for i := range tickets {
+		if total <= 0 || perRecord < 1 {
+			break
+		}
+		tickets[i] = min(perRecord, total)
+		total -= tickets[i]
+	}
+	return lens, tickets
+}
+
+// realityTicketSession returns the session in a ticket REALITY issued and
+// that has not expired, or nil.
+func (c *Config) realityTicketSession(shape *TicketShape, label []byte) *SessionState {
+	if !bytes.HasPrefix(label, shape.Prefix) {
+		return nil
+	}
+	plaintext := c.decryptTicket(label[len(shape.Prefix):], c.realityTicketKeys())
+	if plaintext == nil {
+		return nil
+	}
+	session, err := ParseSessionState(plaintext)
+	if err != nil || session.version != VersionTLS13 || session.isClient {
+		return nil
+	}
+	age := c.time().Sub(time.Unix(int64(session.createdAt), 0))
+	if age < -time.Minute || age > time.Duration(shape.Lifetime)*time.Second {
+		return nil
+	}
+	return session
+}
+
+// checkBinder checks the binder of the first PSK identity of ch against
+// session, and returns the early secret the session gives.
+func checkBinder(suite *cipherSuiteTLS13, session *SessionState, ch *clientHelloMsg) (*tls13.EarlySecret, bool) {
+	earlySecret := tls13.NewEarlySecret(suite.hash.New, session.secret)
+	helloBytes, err := ch.marshalWithoutBinders()
+	if err != nil {
+		return nil, false
+	}
+	transcript := suite.hash.New()
+	transcript.Write(helloBytes)
+	return earlySecret, hmac.Equal(ch.pskBinders[0], suite.finishedHash(earlySecret.ResumptionBinderKey(), transcript))
+}
+
+// ticketRefusal returns what the target sends back to one of its own
+// tickets offered with a wrong binder, if the ClientHello offers one of
+// REALITY's tickets so, authenticated or not. A censor that saw the ticket
+// on the wire cannot compute its binder; a server that issued the ticket
+// refuses it, where the target, which does not know it, would go on with a
+// full handshake.
+func (hs *serverHandshakeStateTLS13) ticketRefusal() *TicketShape {
+	ch := hs.clientHello
+	if len(ch.pskIdentities) == 0 || len(ch.pskIdentities) != len(ch.pskBinders) ||
+		!slices.Contains(ch.pskModes, pskModeDHE) {
+		return nil
+	}
+	key, _ := recordsKey(hs.c.config, ch)
+	shape := LoadTicketShape(key)
+	if shape == nil || !shape.Resumes || !shape.RefusesBadBinder {
+		return nil
+	}
+	session := hs.c.config.realityTicketSession(shape, ch.pskIdentities[0].label)
+	if session == nil {
+		return nil
+	}
+	suite := cipherSuiteTLS13ByID(session.cipherSuite)
+	if suite == nil {
+		return nil
+	}
+	if _, ok := checkBinder(suite, session, ch); ok {
+		return nil
+	}
+	return shape
 }

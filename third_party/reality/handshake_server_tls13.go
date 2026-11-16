@@ -72,6 +72,7 @@ type serverHandshakeStateTLS13 struct {
 	// [REALITY] SECTION: session tickets
 	ticketShape    *TicketShape // set when the client asked for tickets and the target's are known
 	ticketInFlight bool         // a ticket went with the server's flight
+	refusal        *TicketShape // set when a ticket came with a wrong binder: how the target refuses it
 	// [REALITY] SECTION END
 }
 
@@ -193,8 +194,8 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		hs.ticketInFlight = true
 		msg := []byte{typeNewSessionTicket}
 		if hs.ticketShape != nil {
-			if ticket := c.realityTicketMsg(hs.ticketShape, hs.c.out.handshakeLen[6]); ticket != nil {
-				msg = ticket
+			if tickets := c.ticketMsgs(hs.ticketShape, hs.c.out.handshakeLen[6], 1); tickets != nil {
+				msg = tickets[0]
 				c.out.ticket = true
 			}
 		}
