@@ -36,7 +36,9 @@ def load(run, name):
 
 
 def tag(r):
-    return "+".join(r.get("hs", [])) or r["type"]
+    # A compressed certificate goes where the certificate does: REALITY
+    # sends its own in a record as long, which a censor cannot tell apart.
+    return "+".join("Cert" if t == "CompCert" else t for t in r.get("hs", [])) or r["type"]
 
 
 def server_shape(stream):
@@ -64,13 +66,52 @@ def ext_key(exts, ordered):
     return exts if ordered else sorted(exts)
 
 
+def norm(v):
+    """GREASE values compare equal to each other."""
+    try:
+        n = int(v, 0) if isinstance(v, str) else int(v)
+    except ValueError:
+        return v
+    return "GREASE" if n in GREASE else n
+
+
+# Extensions whose length a browser picks at random per connection: their
+# lengths are compared as the sets seen over all connections instead.
+RANDOM_LEN = {"chrome": {0xfe0d}, "edge": {0xfe0d}}
+# The lengths Chromium picks its GREASE ECH from (BoringSSL, uniformly).
+KNOWN_LENS = {0xfe0d: {186, 218, 250, 282}}
+
+
+def hello_diff(ref, ours, skip=()):
+    """Differences in content between two ClientHellos: each field value by
+    value, in order, and the lengths of each extension type."""
+    diffs = []
+    for field, a in ref.get("detail", {}).items():
+        b = ours.get("detail", {}).get(field, [])
+        a, b = [norm(x) for x in a], [norm(x) for x in b]
+        if a != b:
+            diffs.append(f"{field}: ref {a} ours {b}")
+    lens = []
+    for ch in (ref, ours):
+        d = {}
+        for t, l in zip(ch["exts"], ch.get("ext_lens", [])):
+            d.setdefault(norm(t), []).append(l)
+        lens.append(d)
+    for t in sorted(set(lens[0]) | set(lens[1]), key=str):
+        if t in skip:
+            continue
+        if sorted(lens[0].get(t, [])) != sorted(lens[1].get(t, [])):
+            diffs.append(f"ext {t} len: ref {lens[0].get(t)} ours {lens[1].get(t)}")
+    return diffs
+
+
 def same_shape(a, b):
     if len(a) != len(b):
         return False
     for (ta, la), (tb, lb) in zip(a, b):
         if ta != tb:
             return False
-        if abs(la - lb) > (2 if ta == "CV" else 0):
+        if abs(la - lb) > (2 if "CV" in ta.split("+") else 0):
             return False
     return True
 
@@ -85,8 +126,8 @@ def fmt(shape):
     return " ".join(f"{t}:{l}" for t, l in shape)
 
 
-def compare(ref_run, our_run, browser, target):
-    ref = load(ref_run, f"{browser}-{target}")
+def compare(ref_run, our_run, browser, target, ref_name=None):
+    ref = load(ref_run, f"{ref_name or browser}-{target}")
     ours = load(our_run, f"xray-{browser}-{target}")
     rf, rr = split(ref)
     of, orr = split(ours)
@@ -99,15 +140,47 @@ def compare(ref_run, our_run, browser, target):
     if rf and of:
         a, b = ext_key(rf[0]["ch"]["exts"], ordered), ext_key(of[0]["ch"]["exts"], ordered)
         check("hello full", a == b, f"ref {a}\n             ours {b}" if a != b else "")
+        d = hello_diff(rf[0]["ch"], of[0]["ch"], RANDOM_LEN.get(browser, ()))
+        check("hello content", not d, "\n             ".join(d))
         a, b = server_shape(rf[0]), server_shape(of[0])
         # the reference's first connection may end before its tickets came
         full_ref = max((server_shape(s) for s in rf), key=tickets)
         check("full", same_shape(full_ref, b), f"ref  {fmt(full_ref)}\n             ours {fmt(b)}")
     else:
         check("full", False, "no full handshake")
+    for t in RANDOM_LEN.get(browser, ()):
+        seen = []
+        # all of the browser's connections in the reference run, any target
+        every = [st for d in sorted(os.listdir(ref_run)) if d.startswith(f"{ref_name or browser}-")
+                 for st in load(ref_run, d)]
+        for streams in (every, ours):
+            seen.append(sorted({l for s in streams if s["ch"] for e, l in zip(s["ch"]["exts"], s["ch"]["ext_lens"]) if e == t}))
+        check(f"ext {t} lens", set(seen[1]) <= set(seen[0]) | KNOWN_LENS.get(t, set()),
+              f"ref {seen[0]} ours {seen[1]}")
+    # Time from the ServerHello to the client's Finished of full handshakes,
+    # over that of resumed ones: the browser verifying the certificate.
+    def verify_ms(streams):
+        full = [s["timing"]["client_fin"] - s["timing"]["sh"] for s in streams
+                if s["ch"] and not s["ch"]["psk_identities"] and "client_fin" in s.get("timing", {}) and "sh" in s["timing"]]
+        res = sorted(s["timing"]["client_fin"] - s["timing"]["sh"] for s in streams
+                     if s["ch"] and s["ch"]["psk_identities"] and "client_fin" in s.get("timing", {}) and "sh" in s["timing"])
+        if not full or not res:
+            return None
+        base = res[len(res) // 2]
+        return [round(f - base, 1) for f in full]
+    a = [x for d in sorted(os.listdir(ref_run)) if d.startswith(f"{ref_name or browser}-")
+         for x in (verify_ms(load(ref_run, d)) or [])]
+    b = verify_ms(ours)
+    if a and b:
+        # A browser's first verification after it starts is slow (125 ms
+        # for a real chain here), later ones are not: ours only has to fall
+        # in the range.
+        check("verify delay", min(a) - 10 <= min(b) and max(b) <= max(a) + 10, f"ref {a} ours {b} ms")
     if rr and orr:
         a, b = ext_key(rr[0]["ch"]["exts"], ordered), ext_key(orr[0]["ch"]["exts"], ordered)
         check("hello resumed", a == b, f"ref {a}\n             ours {b}" if a != b else "")
+        d = hello_diff(rr[0]["ch"], orr[0]["ch"], RANDOM_LEN.get(browser, ()))
+        check("hello res cont", not d, "\n             ".join(d))
         a, b = rr[0]["ch"]["psk_identities"], orr[0]["ch"]["psk_identities"]
         check("psk", a == b, f"ref {a} ours {b}")
         a, b = server_shape(rr[0]), server_shape(orr[0])
@@ -120,10 +193,13 @@ def compare(ref_run, our_run, browser, target):
 def main():
     ref_run, our_run = sys.argv[1], sys.argv[2]
     failed = 0
-    for target in ("nginx", "caddy", "haproxy"):
-        for browser in ("chrome", "firefox"):
-            print(f"== {browser} via {target}")
-            for name, ok, detail in compare(ref_run, our_run, browser, target):
+    targets = sorted({d[len("xray-chrome-"):] for d in os.listdir(our_run) if d.startswith("xray-chrome-")})
+    for target in targets:
+        for browser, ref_name in (("chrome", "chrome"), ("edge", "edge"), ("firefox", "firefox156"), ("firefox", "firefox160")):
+            if not os.path.isdir(f"{ref_run}/{ref_name}-{target}"):
+                continue
+            print(f"== {browser} via {target}, reference {ref_name}")
+            for name, ok, detail in compare(ref_run, our_run, browser, target, ref_name):
                 failed += not ok
                 print(f"  {'ok  ' if ok else 'DIFF'} {name:14s}" + (f" {detail}" if detail and not ok else ""))
     print(f"{failed} differences")

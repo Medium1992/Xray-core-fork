@@ -33,6 +33,7 @@ TARGETS = {"nginx": "10.9.0.11", "caddy": "10.9.0.12", "haproxy": "10.9.0.13"}
 # targets only REALITY uses, not the browser references
 EXTRA_TARGETS = {"nginxshort": "10.9.0.14"}  # tickets live 8 s
 NEW_SERVER = {"nginx": "10.9.0.21", "caddy": "10.9.0.22", "haproxy": "10.9.0.23", "nginxshort": "10.9.0.24"}
+STUB = "10.9.0.60"  # REALITY in front of the operator's own site at 127.0.0.1:8443
 LB = "10.9.0.40"  # HAProxy in TCP mode, round robin over the new and the old server for nginx
 OLD_SERVER = {"nginx": "10.9.0.31", "caddy": "10.9.0.32", "haproxy": "10.9.0.33"}
 HTTP = "10.9.0.50"
@@ -95,14 +96,15 @@ def topology():
     hosts = f"{S}/runs/hosts"
     with open(hosts, "w") as f:
         f.write("127.0.0.1 localhost\n")
-        for name, ip in TARGETS.items():
+        for name, ip in {**TARGETS, **EXTRA_TARGETS}.items():
             f.write(f"{ip} {name}.example.test\n")
+        f.write(f"{STUB} stub.example.test\n")
     sh(f"mount --bind {hosts} /etc/hosts")
     sh("ip netns add cli && ip netns add srv")
     sh("ip link add vc type veth peer name vs && ip link set vc netns cli && ip link set vs netns srv")
     sh("ip -n cli addr add 10.9.0.1/24 dev vc && ip -n cli link set vc up && ip -n cli link set lo up")
     sh("ip -n srv addr add 10.9.0.2/24 dev vs && ip -n srv link set vs up && ip -n srv link set lo up")
-    for ip in list(TARGETS.values()) + list(EXTRA_TARGETS.values()) + list(NEW_SERVER.values()) + list(OLD_SERVER.values()) + [HTTP, LB]:
+    for ip in list(TARGETS.values()) + list(EXTRA_TARGETS.values()) + list(NEW_SERVER.values()) + list(OLD_SERVER.values()) + [HTTP, LB, STUB]:
         sh(f"ip -n srv addr add {ip}/32 dev vs")
     sh("ip -n cli route add 10.9.0.0/24 dev vc 2>/dev/null || true")
     rtt = int(os.environ.get("RTT_MS", "60"))
@@ -133,6 +135,14 @@ def server_config(binary_servers):
                 "target": f"{ {**TARGETS, **EXTRA_TARGETS}[name]}:443", "serverNames": [f"{name}.example.test"],
                 "privateKey": PRIVATE_KEY, "shortIds": [SHORT_ID]}},
         })
+    if binary_servers is NEW_SERVER:
+        inbounds.append({
+            "listen": STUB, "port": 443, "protocol": "vless", "tag": "in-stub",
+            "settings": {"clients": [{"id": UUID, "flow": "xtls-rprx-vision"}], "decryption": "none"},
+            "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
+                "target": "127.0.0.1:8443", "serverNames": ["stub.example.test"],
+                "privateKey": PRIVATE_KEY, "shortIds": [SHORT_ID]}},
+        })
     return {"log": {"loglevel": "warning"}, "inbounds": inbounds,
             "outbounds": [{"protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}}]}
 
@@ -155,7 +165,9 @@ def start_servers(run, old=True):
 
 
 def client_config(server_ip, target, fingerprint, browser, keylog, port=1080):
-    reality = {"fingerprint": fingerprint, "serverName": f"{target}.example.test",
+    # a real site's own name, else a stand target's
+    server_name = target if "." in target else f"{target}.example.test"
+    reality = {"fingerprint": fingerprint, "serverName": server_name,
                "password": PUBLIC_KEY, "shortId": SHORT_ID, "masterKeyLog": keylog}
     if browser:
         reality["browser"] = browser
@@ -220,10 +232,12 @@ def xray_client(run, name, binary, server_ip, target, fingerprint, browser, dial
     return meta
 
 
-PAGE_HOSTS = {"nginx": "nginx.example.test", "caddy": "caddy.example.test", "haproxy": "haproxy.example.test"}
+PAGE_HOSTS = {"nginx": "nginx.example.test", "caddy": "caddy.example.test", "haproxy": "haproxy.example.test",
+              "stub": "stub.example.test"}
+PAGE_PATH = {"stub": "/"}
 
 
-def chrome(run, name, target):
+def chrome(run, name, target, binary=None):
     d = scenario_dir(run, name)
     home = f"{d}/home"
     os.makedirs(f"{home}/.pki/nssdb", exist_ok=True)
@@ -231,18 +245,22 @@ def chrome(run, name, target):
        f"certutil -d sql:{home}/.pki/nssdb -A -t 'C,,' -n standca -i {S}/certs/ca.pem")
     cap = Capture(f"{d}/capture.pcap")
     p = start(f"chrome-{name}", f"ip netns exec cli env HOME={home} SSLKEYLOGFILE={d}/keylog "
-              f"{R}/opt/google/chrome/chrome --headless=new --no-sandbox --disable-gpu --no-first-run "
+              f"{binary or R + '/opt/google/chrome/chrome'} --headless=new --no-sandbox --disable-gpu --no-first-run "
               f"--disable-background-networking --disable-component-update --disable-sync "
-              f"--user-data-dir={home}/profile https://{PAGE_HOSTS[target]}/page.html", f"{d}/chrome.log")
-    time.sleep(12)
+              f"--user-data-dir={home}/profile https://{PAGE_HOSTS[target]}{PAGE_PATH.get(target, '/page.html')}", f"{d}/chrome.log")
+    time.sleep(18)
     stop(p)
     procs.remove((f"chrome-{name}", p))
     cap.close()
     with open(f"{d}/meta.json", "w") as f:
-        json.dump({"kind": "chrome", "target": target}, f, indent=1)
+        json.dump({"kind": "chrome", "binary": binary, "target": target}, f, indent=1)
 
 
-def firefox(run, name, target):
+FIREFOXES = {"firefox": "firefox", "firefox156": f"{R}/opt/firefox-156.0.1/firefox",
+             "firefox160": f"{R}/opt/firefox-160.0/firefox"}  # the system one is 153 ESR
+
+
+def firefox(run, name, target, binary="firefox"):
     d = scenario_dir(run, name)
     profile = f"{d}/profile"
     os.makedirs(profile, exist_ok=True)
@@ -257,14 +275,14 @@ def firefox(run, name, target):
             f.write(f"user_pref({json.dumps(k)}, {json.dumps(v)});\n")
     cap = Capture(f"{d}/capture.pcap")
     p = start(f"firefox-{name}", f"ip netns exec cli env HOME={d} SSLKEYLOGFILE={d}/keylog MOZ_DISABLE_CONTENT_SANDBOX=1 "
-              f"firefox --headless --no-remote --profile {profile} https://{PAGE_HOSTS[target]}/page.html",
+              f"{binary} --headless --no-remote --profile {profile} https://{PAGE_HOSTS[target]}{PAGE_PATH.get(target, '/page.html')}",
               f"{d}/firefox.log")
-    time.sleep(14)
+    time.sleep(19)
     stop(p)
     procs.remove((f"firefox-{name}", p))
     cap.close()
     with open(f"{d}/meta.json", "w") as f:
-        json.dump({"kind": "firefox", "target": target}, f, indent=1)
+        json.dump({"kind": "firefox", "binary": binary, "target": target}, f, indent=1)
 
 
 REPLAY = r"""
@@ -324,8 +342,184 @@ def replay_probe(run, name, source):
         json.dump({"kind": "replay", "answers": json.loads(r.stdout or "{}"), "stderr": r.stderr[-500:]}, f, indent=1)
 
 
+TICKET_PROBE = r"""
+import json, socket, struct, sys
+
+def records(addr, hello):
+    s = socket.create_connection((addr, 443), 5)
+    s.sendall(hello)
+    s.settimeout(2)
+    data = b""
+    try:
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            data += b
+    except Exception:
+        pass
+    s.close()
+    out = []
+    while len(data) >= 5:
+        n = 5 + struct.unpack(">H", data[3:5])[0]
+        body = data[5:n]
+        out.append([data[0], n] + (list(body[:2]) if data[0] == 21 else []))
+        data = data[n:]
+    return out
+
+def psk(hello):
+    # offset and length of the first PSK identity
+    p = 5 + 4 + 2 + 32
+    p += 1 + hello[p]
+    p += 2 + struct.unpack(">H", hello[p:p+2])[0]
+    p += 1 + hello[p]
+    end = p + 2 + struct.unpack(">H", hello[p:p+2])[0]
+    p += 2
+    while p < end:
+        t, l = struct.unpack(">HH", hello[p:p+4])
+        if t == 41:
+            q = p + 4 + 2
+            return q + 2, struct.unpack(">H", hello[q:q+2])[0]
+        p += 4 + l
+    return None
+
+def bad_binder(h):
+    h = bytearray(h)
+    h[-1] ^= 1
+    return bytes(h)
+
+addr = sys.argv[1]
+browser = open(sys.argv[2], "rb").read()
+ours = open(sys.argv[3], "rb").read()
+result = {
+    "browser ticket, bad binder": records(addr, bad_binder(browser)),
+    "our ticket, bad binder, our ClientHello": records(addr, bad_binder(ours)),
+}
+bo, bn = psk(browser)
+oo, on = psk(ours)
+if bn == on:
+    t = bytearray(browser)
+    t[bo:bo+bn] = ours[oo:oo+on]
+    result["our ticket, bad binder, browser ClientHello"] = records(addr, bytes(t))
+else:
+    result["our ticket, browser ClientHello"] = f"ticket lengths differ: {bn} {on}"
+print(json.dumps(result))
+"""
+
+
+def resumed_hello(scenario):
+    """The first ClientHello in a scenario's capture that offers a ticket."""
+    out = subprocess.run(f"tshark -r {scenario}/capture.pcap -Y 'tls.handshake.extensions.psk.identities.length' "
+                         f"-T fields -e tcp.stream", shell=True, env=ENV, capture_output=True, text=True).stdout.split()
+    if not out:
+        return None
+    raw = subprocess.run(f"tshark -r {scenario}/capture.pcap -q -z follow,tcp,raw,{out[0]}", shell=True, env=ENV,
+                         capture_output=True, text=True).stdout
+    client = b"".join(bytes.fromhex(l.strip()) for l in raw.splitlines()
+                      if l and not l.startswith(("\t", "=", "Follow", "Filter", "Node"))
+                      and all(c in "0123456789abcdef" for c in l.strip()))
+    return client[:5 + int.from_bytes(client[3:5], "big")]
+
+
+def ticket_probe(run):
+    """A censor takes tickets seen on the wire to the server with a binder
+    it cannot compute. A server that issued the ticket refuses the binder
+    (decrypt_error), whichever ClientHello carries it."""
+    d = scenario_dir(run, "stub-ticket-probe")
+    browser, ours = resumed_hello(f"{run}/chrome-stub"), resumed_hello(f"{run}/xray-chrome-stub")
+    if browser is None or ours is None:
+        with open(f"{d}/meta.json", "w") as f:
+            json.dump({"kind": "probe", "error": "no resumed ClientHello"}, f)
+        return
+    for name, data in (("browser.bin", browser), ("ours.bin", ours), ("probe.py", TICKET_PROBE.encode())):
+        with open(f"{d}/{name}", "wb") as f:
+            f.write(data)
+    cap = Capture(f"{d}/capture.pcap")
+    r = subprocess.run(f"ip netns exec cli python3 {d}/probe.py {STUB} {d}/browser.bin {d}/ours.bin",
+                       shell=True, env=ENV, capture_output=True, text=True)
+    cap.close()
+    with open(f"{d}/meta.json", "w") as f:
+        json.dump({"kind": "probe", "answers": json.loads(r.stdout or "{}"), "stderr": r.stderr[-800:]}, f, indent=1)
+
+
+# Real sites as targets: `pasta --config-net -- unshare -m python3 stand.py
+# real [site...]`. pasta gives the outer namespace the Internet; REALITY runs
+# there in front of each site, and the clients in "cli" behind the veth.
+REAL_SITES = ["www.microsoft.com", "www.cloudflare.com", "ya.ru", "github.com", "www.lovelive-anime.jp"]
+
+
+def topology_real(sites):
+    """cli 10.9.0.1 --veth-- outer namespace 10.9.0.2 (Internet by pasta),
+    REALITY for site i at 10.9.0.(70+i), plain HTTP at 10.9.0.50."""
+    import socket
+    real_ips = {site: socket.gethostbyname(site) for site in sites}  # before /etc/hosts points them here
+    sh("mount -t tmpfs none /run && mkdir -p /run/netns")
+    servers = {site: f"10.9.0.{70 + i}" for i, site in enumerate(sites)}
+    hosts = f"{S}/runs/hosts-real"
+    with open(hosts, "w") as f:
+        f.write("127.0.0.1 localhost\n")
+        for site, ip in servers.items():
+            f.write(f"{ip} {site}\n")
+    sh(f"mount --bind {hosts} /etc/hosts")
+    sh("ip netns add cli")
+    sh("ip link add vc type veth peer name vs && ip link set vc netns cli")
+    sh("ip -n cli addr add 10.9.0.1/24 dev vc && ip -n cli link set vc up && ip -n cli link set lo up")
+    sh("ip addr add 10.9.0.2/24 dev vs && ip link set vs up")
+    for ip in list(servers.values()) + [HTTP]:
+        sh(f"ip addr add {ip}/32 dev vs")
+    return real_ips, servers
+
+
+def chrome_revisits(run, name, site, server_ip, binary=None, visits=4):
+    """Chrome visits a real site, then again over new connections: its
+    sockets are killed in between and a new tab opened by DevTools."""
+    d = scenario_dir(run, name)
+    home = f"{d}/home"
+    os.makedirs(home, exist_ok=True)
+    cap = Capture(f"{d}/capture.pcap")
+    p = start(f"chrome-{name}", f"ip netns exec cli env HOME={home} SSLKEYLOGFILE={d}/keylog "
+              f"{binary or R + '/opt/google/chrome/chrome'} --headless=new --no-sandbox --disable-gpu --no-first-run "
+              f"--disable-background-networking --disable-component-update --disable-sync "
+              f"--remote-debugging-port=9222 --user-data-dir={home}/profile https://{site}/", f"{d}/chrome.log")
+    time.sleep(8)
+    for _ in range(visits - 1):
+        sh(f"ip netns exec cli ss -K dst {server_ip} >/dev/null 2>&1", check=False)
+        time.sleep(1)
+        sh(f"ip netns exec cli curl -s -X PUT 'http://127.0.0.1:9222/json/new?https://{site}/' >/dev/null", check=False)
+        time.sleep(7)
+    stop(p)
+    procs.remove((f"chrome-{name}", p))
+    cap.close()
+    with open(f"{d}/meta.json", "w") as f:
+        json.dump({"kind": "chrome", "binary": binary, "target": site}, f, indent=1)
+
+
+def run_real(run, sites):
+    real_ips, servers = topology_real(sites)
+    inbounds = [{
+        "listen": servers[site], "port": 443, "protocol": "vless", "tag": f"in-{site}",
+        "settings": {"clients": [{"id": UUID, "flow": "xtls-rprx-vision"}], "decryption": "none"},
+        "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
+            "target": f"{real_ips[site]}:443", "serverNames": [site],
+            "privateKey": PRIVATE_KEY, "shortIds": [SHORT_ID]}},
+    } for site in sites]
+    with open(f"{run}/server-real.json", "w") as f:
+        json.dump({"log": {"loglevel": "warning"}, "inbounds": inbounds,
+                   "outbounds": [{"protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}}]}, f, indent=1)
+    with open(f"{run}/real.json", "w") as f:
+        json.dump({"sites": real_ips, "servers": servers}, f, indent=1)
+    start("http", f"python3 -m http.server --bind {HTTP} 80 --directory {S}/www", f"{run}/http.log")
+    start("server-real", f"xray-new run -c {run}/server-real.json", f"{run}/server-real.log")
+    time.sleep(45)  # REALITY probes each site, a wrong binder last
+    for site in sites:
+        chrome_revisits(run, f"chrome-{site}", site, servers[site])
+        chrome_revisits(run, f"edge-{site}", site, servers[site], f"{R}/opt/microsoft/msedge/msedge")
+        for fp in ("chrome", "firefox", "edge"):
+            xray_client(run, f"xray-{fp}-{site}", "xray-new", servers[site], site, fp, "auto", 4)
+
+
 def render():
-    """Configs and the page, from the templates next to this script."""
+    """Configs, the page and the stub site, from next to this script."""
     os.makedirs(f"{S}/conf", exist_ok=True)
     os.makedirs(f"{S}/www", exist_ok=True)
     for name in os.listdir(f"{CODE}/conf"):
@@ -334,6 +528,7 @@ def render():
         with open(f"{S}/conf/{name.removesuffix('.in')}", "w") as f:
             f.write(text)
     shutil.copy(f"{CODE}/www/page.html", f"{S}/www/page.html")
+    shutil.copytree(f"{CODE}/stub", f"{S}/stub", dirs_exist_ok=True)
 
 
 def main():
@@ -344,20 +539,40 @@ def main():
     with open(f"{run}/run.json", "w") as f:
         json.dump({"rtt_ms": int(os.environ.get("RTT_MS", "60")), "args": sys.argv[1:]}, f)
     wanted = sys.argv[1:] or ["browsers", "xray"]
+    if wanted[0] == "real":
+        try:
+            run_real(run, wanted[1:] or REAL_SITES)
+        finally:
+            stop_all()
+        print(run)
+        return
     topology()
     try:
         start_targets(run)
+        if "stub" in wanted:
+            start_servers(run, old="compat" in wanted or "edge" in wanted)
         if "browsers" in wanted:
             for target in TARGETS:
                 chrome(run, f"chrome-{target}", target)
-                firefox(run, f"firefox-{target}", target)
-        if "xray" in wanted or "compat" in wanted or "edge" in wanted:
+                chrome(run, f"edge-{target}", target, f"{R}/opt/microsoft/msedge/msedge")
+                for name, binary in FIREFOXES.items():
+                    firefox(run, f"{name}-{target}", target, binary)
+        if ("xray" in wanted or "compat" in wanted or "edge" in wanted) and "stub" not in wanted:
             start_servers(run, old="compat" in wanted or "edge" in wanted)
         if "xray" in wanted:
             for target in TARGETS:
-                for fp in ("chrome", "firefox"):
+                for fp in ("chrome", "firefox", "edge"):
                     xray_client(run, f"xray-{fp}-{target}", "xray-new", NEW_SERVER[target], target, fp, "auto", 4)
                 xray_client(run, f"xray-off-{target}", "xray-new", NEW_SERVER[target], target, "chrome", "", 3)
+            for fp in ("safari", "ios"):
+                xray_client(run, f"xray-{fp}-nginx", "xray-new", NEW_SERVER["nginx"], "nginx", fp, "auto", 3)
+        if "stub" in wanted:
+            for name, binary in (("chrome", None), ("edge", f"{R}/opt/microsoft/msedge/msedge")):
+                chrome(run, f"{name}-stub", "stub", binary)
+            firefox(run, "firefox160-stub", "stub", FIREFOXES["firefox160"])
+            for fp in ("chrome", "firefox", "edge"):
+                xray_client(run, f"xray-{fp}-stub", "xray-new", STUB, "stub", fp, "auto", 4)
+            ticket_probe(run)
         if "edge" in wanted:
             # The ticket from the first connection expires during the pause.
             xray_client(run, "edge-expiry", "xray-new", NEW_SERVER["nginxshort"], "nginxshort", "chrome", "auto", 4,

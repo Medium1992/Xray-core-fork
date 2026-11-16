@@ -28,4 +28,13 @@ http {
     ssl_session_timeout 8s;
     root @WORK@/www;
   }
+  # the operator's own site behind REALITY on the same server
+  server {
+    listen 127.0.0.1:8443 ssl;
+    http2 on;
+    server_name stub.example.test;
+    ssl_certificate @WORK@/certs/chain.pem;
+    ssl_certificate_key @WORK@/certs/site.key;
+    root @WORK@/stub;
+  }
 }

@@ -19,7 +19,24 @@ ENV = dict(os.environ)
 ENV["PATH"] = f"{R}/usr/bin:" + ENV.get("PATH", "")
 ENV["LD_LIBRARY_PATH"] = f"{R}/usr/lib/x86_64-linux-gnu:{R}/lib/x86_64-linux-gnu"
 
-HS = {1: "CH", 2: "SH", 4: "NST", 8: "EE", 11: "Cert", 13: "CR", 15: "CV", 20: "Fin", 24: "KU"}
+# ClientHello fields compared value by value.
+HELLO_FIELDS = {
+    "ciphers": "tls.handshake.ciphersuite",
+    "groups": "tls.handshake.extensions_supported_group",
+    "key_shares": "tls.handshake.extensions_key_share_group",
+    "key_share_lens": "tls.handshake.extensions_key_share_key_exchange_length",
+    "sig_algs": "tls.handshake.sig_hash_alg",
+    "versions": "tls.handshake.extensions.supported_version",
+    "alpn": "tls.handshake.extensions_alpn_str",
+    "cert_compression": "tls.compress_certificate.algorithm",
+    "psk_modes": "tls.extension.psk_ke_mode",
+    "record_size_limit": "tls.record_size_limit",
+    "point_formats": "tls.handshake.extensions_ec_point_format",
+    "status_request": "tls.handshake.extensions_status_request_type",
+    "session_id_len": "tls.handshake.session_id_length",
+    "compression": "tls.handshake.comp_method",
+}
+HS = {1: "CH", 2: "SH", 4: "NST", 8: "EE", 11: "Cert", 13: "CR", 15: "CV", 20: "Fin", 24: "KU", 25: "CompCert"}
 CT = {20: "CCS", 21: "Alert", 22: "HS", 23: "App"}
 
 
@@ -91,6 +108,9 @@ def analyze(scenario_dir):
                     "exts": exts,
                     "psk_identities": [int(x) for x in walk(rec, "tls.handshake.extensions.psk.identity.identity_length")],
                     "ja4": (walk(rec, "tls.handshake.ja4") or [""])[0],
+                    # length of each extension, in order with exts
+                    "ext_lens": [int(x) for x in walk(rec, "tls.handshake.extension.len")],
+                    "detail": {name: [str(v) for v in walk(rec, field)] for name, field in HELLO_FIELDS.items()},
                 }
     for st in streams.values():
         st["timing"] = timing(st["records"])

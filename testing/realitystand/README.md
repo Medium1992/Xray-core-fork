@@ -54,12 +54,33 @@ for Chrome, which shuffles them, the order for Firefox), PSK identity length,
 and the server records of full and resumed handshakes by type and length
 (CertificateVerify within 2 bytes).
 
-## Findings (2026-11-16, Chrome 157, Firefox 153 ESR)
+## Findings (2026-11-16)
 
-- Records of full and resumed handshakes through REALITY match the targets'
-  for nginx, Caddy and HAProxy, at 0 and 60 ms RTT, ClientHellos and PSK
-  identity lengths match the browsers'.
-- Firefox drops `session_ticket` when it offers a ticket; Chrome keeps it.
+References: Chrome 157, Edge 157, Firefox 156.0.1 and 160.0 (Firefox 153 ESR
+of the system too), straight to each target. With the changes below,
+`compare.py` finds no difference for chrome, edge and firefox through
+REALITY: ClientHello content (every field and every extension's length;
+GREASE ECH lengths as sets for Chromium, which picks them at random), PSK
+identity length, the server's records of full and resumed handshakes, and
+the time the client takes for its Finished.
+
+- Firefox drops `session_ticket` when it offers a ticket and grows its
+  GREASE ECH payload by the size of `pre_shared_key` rounded up to 32
+  bytes; Chrome and Edge keep `session_ticket` and pick ECH lengths from
+  {186, 218, 250, 282} regardless.
+- Edge 157 is Chrome 155's ClientHello without `trust_anchors`; uTLS's
+  `edge` was Edge 85, with no ML-KEM key share, which REALITY servers
+  refuse. `ios` was iOS 14, also refused; it is now Safari 26.3's, which
+  JA4 databases show for current macOS Safari and, at each version, the
+  same for iOS.
+- Safari's ClientHello (26.3) matches the most common Safari 27 JA4
+  (`t13d2013h2_a09f3c656075_7f0f34a4126d`). No Safari JA4 seen in the wild
+  is that ClientHello with `pre_shared_key`, so `safari` and `ios` do not
+  resume.
+- Browsers send their Finished later in full handshakes, verifying the
+  certificate chain: Chrome 8-18 ms, Edge 7-10 ms, Firefox 1-5 ms over
+  resumed ones (this 4-core machine). The client now waits as long after
+  verifying REALITY's certificate.
 - Old and new clients and servers work together in every combination.
 - Behind one address with an old server, a ticket that reaches the old one
   ends in the target's certificate and a dropped connection; the client then
@@ -69,9 +90,6 @@ and the server records of full and resumed handshakes by type and length
   own ticket, but a censor who sends the ticket to the real site sees it
   refused. This adds to REALITY's known IP–SNI mismatch rather than opening
   a new hole.
-- In full handshakes the browsers send their Finished 3 to 13 ms later than
-  the REALITY client, which verifies an HMAC instead of a certificate chain.
-  Not related to tickets.
 
 ## Not covered yet
 
