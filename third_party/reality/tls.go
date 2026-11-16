@@ -456,6 +456,10 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					if postHandshakeRecordsLens, ok := val.([]int); ok {
 						lens, tickets := hs.postHandshakeRecords(postHandshakeRecordsLens)
 						for i, length := range lens {
+							if config.AppRecords && tickets[i] == 0 {
+								hs.c.out.appPad = append(hs.c.out.appPad, length)
+								continue
+							}
 							if tickets[i] > 0 {
 								if msgs := hs.c.ticketMsgs(hs.ticketShape, length, tickets[i]); msgs != nil {
 									hs.c.writeTicketRecord(msgs, length)

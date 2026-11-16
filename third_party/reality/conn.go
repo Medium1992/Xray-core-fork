@@ -197,6 +197,10 @@ type halfConn struct {
 	handshakeBuf []byte
 	// ticket keeps a NewSessionTicket one: a real ticket, not a stand-in.
 	ticket bool
+	// appPad are the lengths the application's first records take, those
+	// of the records the target sends after the handshake, when the
+	// application writes them itself (Config.AppRecords).
+	appPad []int
 	// [REALITY] SECTION END
 
 	sync.Mutex
@@ -581,6 +585,14 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, err
 					return nil, fmt.Errorf("payload[0]: %v, padding: %v", payload[0], padding)
 				}
 				record = append(record, empty[:padding]...)
+			}
+			if recordType(record[0]) == recordTypeApplicationData && len(hc.appPad) > 0 {
+				// The application's first records, as long as the
+				// target's: padded when shorter, as TLS 1.3 allows.
+				if pad := hc.appPad[0] - len(record) - c.Overhead(); pad > 0 {
+					record = append(record, empty[:pad]...)
+				}
+				hc.appPad = hc.appPad[1:]
 			}
 			record[0] = byte(recordTypeApplicationData)
 

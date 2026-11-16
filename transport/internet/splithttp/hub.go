@@ -558,7 +558,11 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			}
 		}
 		if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
-			l.listener = goreality.NewListener(l.listener, config.GetREALITYConfig())
+			// The HTTP/2 server sends what the target sends after the
+			// handshake, shaped as the target's records, see shapeConn.
+			realityConfig := config.GetREALITYConfig()
+			realityConfig.AppRecords = true
+			l.listener = &shapeListener{Listener: goreality.NewListener(l.listener, realityConfig)}
 		}
 
 		handler.localAddr = l.listener.Addr()

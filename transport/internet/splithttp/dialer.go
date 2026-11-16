@@ -264,8 +264,12 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		h2 := newH2Transport(transportConfig.h2ReceiveConfig(false))
 		h2.DialTLSContext = func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
 			conn, err := dialContext(ctxInner)
-			if err != nil || !governed {
+			if err != nil {
 				return conn, err
+			}
+			conn = &ackConn{Conn: conn}
+			if !governed {
+				return conn, nil
 			}
 			return newFlowClientConn(conn), nil
 		}

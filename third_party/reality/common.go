@@ -606,6 +606,13 @@ type Config struct {
 
 	Mldsa65Key *mldsa.PrivateKey
 
+	// AppRecords is set when the application sends, after the handshake,
+	// what the target sends there itself, such as HTTP/2's SETTINGS:
+	// REALITY then sends only the tickets, and pads the application's first
+	// records to the lengths of the target's instead of sending records of
+	// its own.
+	AppRecords bool
+
 	LimitFallbackUpload   LimitFallback
 	LimitFallbackDownload LimitFallback
 	// [REALITY] SECTION END
