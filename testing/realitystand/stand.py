@@ -33,6 +33,9 @@ TARGETS = {"nginx": "10.9.0.11", "caddy": "10.9.0.12", "haproxy": "10.9.0.13"}
 # targets only REALITY uses, not the browser references
 EXTRA_TARGETS = {"nginxshort": "10.9.0.14"}  # tickets live 8 s
 NEW_SERVER = {"nginx": "10.9.0.21", "caddy": "10.9.0.22", "haproxy": "10.9.0.23", "nginxshort": "10.9.0.24"}
+XHTTP_SERVER = {"nginx": "10.9.0.25", "stub": "10.9.0.62"}  # XHTTP, REALITY and VLESS encryption
+VLESS_DECRYPTION = "mlkem768x25519plus.native.600s.4C-Jfmbk0JonPavemvoIorZ67XgTDcoQbNZ8QEDqhEI"
+VLESS_ENCRYPTION = "mlkem768x25519plus.native.0rtt.IXfd7hgLhfrSnUecWr7SMtDrSBY6YHo-Gh107IJeHFE"
 STUB = "10.9.0.60"  # REALITY in front of the operator's own site at 127.0.0.1:8443
 LB = "10.9.0.40"  # HAProxy in TCP mode, round robin over the new and the old server for nginx
 OLD_SERVER = {"nginx": "10.9.0.31", "caddy": "10.9.0.32", "haproxy": "10.9.0.33"}
@@ -104,7 +107,7 @@ def topology():
     sh("ip link add vc type veth peer name vs && ip link set vc netns cli && ip link set vs netns srv")
     sh("ip -n cli addr add 10.9.0.1/24 dev vc && ip -n cli link set vc up && ip -n cli link set lo up")
     sh("ip -n srv addr add 10.9.0.2/24 dev vs && ip -n srv link set vs up && ip -n srv link set lo up")
-    for ip in list(TARGETS.values()) + list(EXTRA_TARGETS.values()) + list(NEW_SERVER.values()) + list(OLD_SERVER.values()) + [HTTP, LB, STUB]:
+    for ip in list(TARGETS.values()) + list(EXTRA_TARGETS.values()) + list(NEW_SERVER.values()) + list(OLD_SERVER.values()) + [HTTP, LB, STUB] + list(XHTTP_SERVER.values()):
         sh(f"ip -n srv addr add {ip}/32 dev vs")
     sh("ip -n cli route add 10.9.0.0/24 dev vc 2>/dev/null || true")
     rtt = int(os.environ.get("RTT_MS", "60"))
@@ -120,6 +123,9 @@ def start_targets(run):
     start("caddy", f"ip netns exec srv env HOME={S}/runs XDG_DATA_HOME={S}/runs/caddy caddy run --config {S}/conf/Caddyfile --adapter caddyfile", f"{run}/caddy.log")
     start("haproxy", f"ip netns exec srv haproxy -f {S}/conf/haproxy.cfg", f"{run}/haproxy.log")
     start("http", f"ip netns exec srv python3 -m http.server --bind {HTTP} 80 --directory {S}/www", f"{run}/http.log")
+    with open(f"{run}/upload_sink.py", "w") as f:
+        f.write(UPLOAD_SINK)
+    start("upload", f"ip netns exec srv python3 {run}/upload_sink.py {HTTP}", f"{run}/upload.log")
     for ip in TARGETS.values():
         wait_port("srv", ip, 443)
     wait_port("srv", HTTP, 80)
@@ -136,6 +142,16 @@ def server_config(binary_servers):
                 "privateKey": PRIVATE_KEY, "shortIds": [SHORT_ID]}},
         })
     if binary_servers is NEW_SERVER:
+        for name, ip in XHTTP_SERVER.items():
+            target = "127.0.0.1:8443" if name == "stub" else f"{TARGETS[name]}:443"
+            inbounds.append({
+                "listen": ip, "port": 443, "protocol": "vless", "tag": f"xhttp-{name}",
+                "settings": {"clients": [{"id": UUID, "flow": "xtls-rprx-vision"}], "decryption": VLESS_DECRYPTION},
+                "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/assets/v2", "mode": "auto"},
+                                   "security": "reality", "realitySettings": {
+                                       "target": target, "serverNames": [f"{name}.example.test"],
+                                       "privateKey": PRIVATE_KEY, "shortIds": [SHORT_ID]}},
+            })
         inbounds.append({
             "listen": STUB, "port": 443, "protocol": "vless", "tag": "in-stub",
             "settings": {"clients": [{"id": UUID, "flow": "xtls-rprx-vision"}], "decryption": "none"},
@@ -150,11 +166,11 @@ def server_config(binary_servers):
 def start_servers(run, old=True):
     with open(f"{run}/server-new.json", "w") as f:
         json.dump(server_config(NEW_SERVER), f, indent=1)
-    start("server-new", f"ip netns exec srv env SSL_CERT_FILE={S}/certs/ca.pem xray-new run -c {run}/server-new.json", f"{run}/server-new.log")
+    start("server-new", f"ip netns exec srv env SSL_CERT_FILE={S}/certs/real/root.pem xray-new run -c {run}/server-new.json", f"{run}/server-new.log")
     if old:
         with open(f"{run}/server-old.json", "w") as f:
             json.dump(server_config(OLD_SERVER), f, indent=1)
-        start("server-old", f"ip netns exec srv env SSL_CERT_FILE={S}/certs/ca.pem xray-old run -c {run}/server-old.json", f"{run}/server-old.log")
+        start("server-old", f"ip netns exec srv env SSL_CERT_FILE={S}/certs/real/root.pem xray-old run -c {run}/server-old.json", f"{run}/server-old.log")
     for ip in NEW_SERVER.values():
         wait_port("srv", ip, 443)
     if old:
@@ -162,6 +178,16 @@ def start_servers(run, old=True):
             wait_port("srv", ip, 443)
     # REALITY probes the targets when it starts; let it finish.
     time.sleep(12)
+
+
+def xhttp_client_config(server_ip, target, fingerprint, browser, keylog, port=1080):
+    """XHTTP over REALITY with VLESS encryption and Vision."""
+    cfg = client_config(server_ip, target, fingerprint, browser, keylog, port)
+    out = cfg["outbounds"][0]
+    out["settings"]["vnext"][0]["users"][0]["encryption"] = VLESS_ENCRYPTION
+    out["streamSettings"]["network"] = "xhttp"
+    out["streamSettings"]["xhttpSettings"] = {"path": "/assets/v2", "mode": "auto"}
+    return cfg
 
 
 def client_config(server_ip, target, fingerprint, browser, keylog, port=1080):
@@ -206,6 +232,51 @@ def scenario_dir(run, name):
     return d
 
 
+UPLOAD_SINK = r"""
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        while n > 0:
+            n -= len(self.rfile.read(min(n, 65536)))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *a):
+        pass
+http.server.ThreadingHTTPServer((sys.argv[1], 81), H).serve_forever()
+"""
+
+
+def xray_traffic(run, name, server_ip, target, fingerprint, browser, config=None):
+    """Real traffic through a client: a 5 MB download, a 1 MB upload and a
+    few small requests, as a user browsing would make."""
+    d = scenario_dir(run, name)
+    keylog = f"{d}/keylog"
+    cfg = (config or client_config)(server_ip, target, fingerprint, browser, keylog)
+    with open(f"{d}/client.json", "w") as f:
+        json.dump(cfg, f, indent=1)
+    cap = Capture(f"{d}/capture.pcap")
+    client = start(f"client-{name}", f"ip netns exec cli xray-new run -c {d}/client.json", f"{d}/client.log")
+    wait_port("cli", "127.0.0.1", 1080)
+    curl = f"ip netns exec cli curl -s -o /dev/null -w '%{{http_code}} %{{time_total}}' --max-time 60 --socks5-hostname 127.0.0.1:1080"
+    results = {}
+    for label, cmd in (("download", f"{curl} http://{HTTP}/blob5m"),
+                       ("upload", f"{curl} --data-binary @{S}/www/blob1m http://{HTTP}:81/upload"),
+                       ("small1", f"{curl} http://{HTTP}/index.html"),
+                       ("small2", f"{curl} http://{HTTP}/page.html"),
+                       ("small3", f"{curl} http://{HTTP}/index.html?3")):
+        results[label] = subprocess.run(cmd, shell=True, env=ENV, capture_output=True, text=True).stdout
+        time.sleep(1)
+    stop(client)
+    procs.remove((f"client-{name}", client))
+    cap.close()
+    with open(f"{d}/meta.json", "w") as f:
+        json.dump({"kind": "xray-traffic", "server": server_ip, "target": target, "fingerprint": fingerprint,
+                   "browser": browser, "http": results}, f, indent=1)
+
+
 def xray_client(run, name, binary, server_ip, target, fingerprint, browser, dials, pause=1.0, pauses=None):
     """dials connections through an Xray client, each a new REALITY connection."""
     d = scenario_dir(run, name)
@@ -242,7 +313,7 @@ def chrome(run, name, target, binary=None):
     home = f"{d}/home"
     os.makedirs(f"{home}/.pki/nssdb", exist_ok=True)
     sh(f"certutil -d sql:{home}/.pki/nssdb -N --empty-password && "
-       f"certutil -d sql:{home}/.pki/nssdb -A -t 'C,,' -n standca -i {S}/certs/ca.pem")
+       f"certutil -d sql:{home}/.pki/nssdb -A -t 'C,,' -n standca -i {S}/certs/real/root.pem")
     cap = Capture(f"{d}/capture.pcap")
     p = start(f"chrome-{name}", f"ip netns exec cli env HOME={home} SSLKEYLOGFILE={d}/keylog "
               f"{binary or R + '/opt/google/chrome/chrome'} --headless=new --no-sandbox --disable-gpu --no-first-run "
@@ -265,7 +336,7 @@ def firefox(run, name, target, binary="firefox"):
     profile = f"{d}/profile"
     os.makedirs(profile, exist_ok=True)
     sh(f"certutil -d sql:{profile} -N --empty-password && "
-       f"certutil -d sql:{profile} -A -t 'C,,' -n standca -i {S}/certs/ca.pem")
+       f"certutil -d sql:{profile} -A -t 'C,,' -n standca -i {S}/certs/real/root.pem")
     with open(f"{profile}/user.js", "w") as f:
         for k, v in {"browser.shell.checkDefaultBrowser": False, "datareporting.policy.dataSubmissionEnabled": False,
                      "toolkit.telemetry.enabled": False, "app.update.enabled": False,
@@ -475,7 +546,9 @@ def chrome_revisits(run, name, site, server_ip, binary=None, visits=4):
     sockets are killed in between and a new tab opened by DevTools."""
     d = scenario_dir(run, name)
     home = f"{d}/home"
-    os.makedirs(home, exist_ok=True)
+    os.makedirs(f"{home}/.pki/nssdb", exist_ok=True)
+    sh(f"certutil -d sql:{home}/.pki/nssdb -N --empty-password && "
+       f"certutil -d sql:{home}/.pki/nssdb -A -t 'C,,' -n standroot -i {S}/certs/real/root.pem")
     cap = Capture(f"{d}/capture.pcap")
     p = start(f"chrome-{name}", f"ip netns exec cli env HOME={home} SSLKEYLOGFILE={d}/keylog "
               f"{binary or R + '/opt/google/chrome/chrome'} --headless=new --no-sandbox --disable-gpu --no-first-run "
@@ -492,6 +565,64 @@ def chrome_revisits(run, name, site, server_ip, binary=None, visits=4):
     cap.close()
     with open(f"{d}/meta.json", "w") as f:
         json.dump({"kind": "chrome", "binary": binary, "target": site}, f, indent=1)
+
+
+MARIONETTE = r"""
+import json, socket, sys, time
+def recv(f):
+    n = b""
+    while not n.endswith(b":"):
+        n += f.read(1)
+    return json.loads(f.read(int(n[:-1])))
+def send(s, f, i, name, params):
+    data = json.dumps([0, i, name, params]).encode()
+    s.sendall(str(len(data)).encode() + b":" + data)
+    return recv(f)
+for _ in range(100):
+    try:
+        s = socket.create_connection(("127.0.0.1", 2828), 2)
+        break
+    except OSError:
+        time.sleep(0.2)
+f = s.makefile("rb")
+recv(f)
+send(s, f, 1, "WebDriver:NewSession", {"capabilities": {}})
+send(s, f, 2, "WebDriver:Navigate", {"url": sys.argv[1]})
+"""
+
+
+def firefox_revisits(run, name, url, server_ip, binary, visits=4):
+    """Firefox visits a site, then again over new connections: its sockets
+    are killed in between and it navigates by Marionette."""
+    d = scenario_dir(run, name)
+    profile = f"{d}/profile"
+    os.makedirs(profile, exist_ok=True)
+    sh(f"certutil -d sql:{profile} -N --empty-password && "
+       f"certutil -d sql:{profile} -A -t 'C,,' -n standroot -i {S}/certs/real/root.pem")
+    with open(f"{profile}/user.js", "w") as f:
+        for k, v in {"browser.shell.checkDefaultBrowser": False, "datareporting.policy.dataSubmissionEnabled": False,
+                     "toolkit.telemetry.enabled": False, "app.update.enabled": False,
+                     "network.captive-portal-service.enabled": False, "network.connectivity-service.enabled": False,
+                     "browser.safebrowsing.malware.enabled": False, "browser.safebrowsing.phishing.enabled": False,
+                     "extensions.update.enabled": False, "browser.startup.homepage_override.mstone": "ignore"}.items():
+            f.write(f"user_pref({json.dumps(k)}, {json.dumps(v)});\n")
+    with open(f"{d}/marionette.py", "w") as f:
+        f.write(MARIONETTE)
+    cap = Capture(f"{d}/capture.pcap")
+    p = start(f"firefox-{name}", f"ip netns exec cli env HOME={d} SSLKEYLOGFILE={d}/keylog MOZ_DISABLE_CONTENT_SANDBOX=1 "
+              f"{binary} --headless --no-remote --marionette --profile {profile}", f"{d}/firefox.log")
+    for i in range(visits):
+        if i:
+            sh(f"ip netns exec cli ss -K dst {server_ip} >/dev/null 2>&1", check=False)
+            time.sleep(1)
+        # a new query each time, or Firefox takes the page from its cache
+        sh(f"ip netns exec cli python3 {d}/marionette.py '{url}?visit={i}'", check=False)
+        time.sleep(7)
+    stop(p)
+    procs.remove((f"firefox-{name}", p))
+    cap.close()
+    with open(f"{d}/meta.json", "w") as f:
+        json.dump({"kind": "firefox", "binary": binary, "target": url}, f, indent=1)
 
 
 def run_real(run, sites):
@@ -514,6 +645,7 @@ def run_real(run, sites):
     for site in sites:
         chrome_revisits(run, f"chrome-{site}", site, servers[site])
         chrome_revisits(run, f"edge-{site}", site, servers[site], f"{R}/opt/microsoft/msedge/msedge")
+        firefox_revisits(run, f"firefox160-{site}", f"https://{site}/", servers[site], FIREFOXES["firefox160"])
         for fp in ("chrome", "firefox", "edge"):
             xray_client(run, f"xray-{fp}-{site}", "xray-new", servers[site], site, fp, "auto", 4)
 
@@ -549,7 +681,7 @@ def main():
     topology()
     try:
         start_targets(run)
-        if "stub" in wanted:
+        if "stub" in wanted or "xhttp" in wanted:
             start_servers(run, old="compat" in wanted or "edge" in wanted)
         if "browsers" in wanted:
             for target in TARGETS:
@@ -557,7 +689,7 @@ def main():
                 chrome(run, f"edge-{target}", target, f"{R}/opt/microsoft/msedge/msedge")
                 for name, binary in FIREFOXES.items():
                     firefox(run, f"{name}-{target}", target, binary)
-        if ("xray" in wanted or "compat" in wanted or "edge" in wanted) and "stub" not in wanted:
+        if ("xray" in wanted or "compat" in wanted or "edge" in wanted) and "stub" not in wanted and "xhttp" not in wanted:
             start_servers(run, old="compat" in wanted or "edge" in wanted)
         if "xray" in wanted:
             for target in TARGETS:
@@ -567,12 +699,22 @@ def main():
             for fp in ("safari", "ios"):
                 xray_client(run, f"xray-{fp}-nginx", "xray-new", NEW_SERVER["nginx"], "nginx", fp, "auto", 3)
         if "stub" in wanted:
+            # nginx keeps idle connections 75 s there: new ones come after
+            # the browsers' sockets are killed
             for name, binary in (("chrome", None), ("edge", f"{R}/opt/microsoft/msedge/msedge")):
-                chrome(run, f"{name}-stub", "stub", binary)
-            firefox(run, "firefox160-stub", "stub", FIREFOXES["firefox160"])
+                chrome_revisits(run, f"{name}-stub", "stub.example.test", STUB, binary)
+            firefox_revisits(run, "firefox160-stub", "https://stub.example.test/", STUB, FIREFOXES["firefox160"])
             for fp in ("chrome", "firefox", "edge"):
                 xray_client(run, f"xray-{fp}-stub", "xray-new", STUB, "stub", fp, "auto", 4)
             ticket_probe(run)
+        if "xhttp" in wanted:
+            for name, binary in (("chrome", None), ("edge", f"{R}/opt/microsoft/msedge/msedge")):
+                chrome_revisits(run, f"{name}-stub", "stub.example.test", STUB, binary)
+            firefox_revisits(run, "firefox160-stub", "https://stub.example.test/", STUB, FIREFOXES["firefox160"])
+            for target in XHTTP_SERVER:
+                for fp in ("chrome", "firefox", "edge"):
+                    xray_traffic(run, f"xhttp-{fp}-{target}", XHTTP_SERVER[target], target, fp, "auto", xhttp_client_config)
+                xray_traffic(run, f"raw-chrome-{target}", NEW_SERVER.get(target, STUB), target, "chrome", "auto")
         if "edge" in wanted:
             # The ticket from the first connection expires during the pause.
             xray_client(run, "edge-expiry", "xray-new", NEW_SERVER["nginxshort"], "nginxshort", "chrome", "auto", 4,

@@ -7,7 +7,7 @@
 # - Google Chrome stable and Caddy (checked against its release checksums);
 # - a copy of tcpdump: the system one runs under an AppArmor profile that
 #   refuses signals and writes to hidden directories;
-# - a test CA and a certificate for *.example.test;
+# - certificate chains shaped like Let's Encrypt's (certs.sh);
 # - xray-new and xray-old built from the two refs.
 # Firefox comes from the system.
 set -eu
@@ -27,16 +27,11 @@ grep "caddy_${caddy}_linux_amd64.tar.gz" "caddy_${caddy}_checksums.txt" | sha512
 tar -xzf "caddy_${caddy}_linux_amd64.tar.gz" -C "$work/bin" caddy
 cp /usr/bin/tcpdump "$work/bin/tcpdump"
 
-cd "$work/certs"
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 365 \
-  -subj "/CN=Stand Test CA" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
-openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout site.key -out site.csr -subj /CN=example.test
-printf 'subjectAltName=DNS:example.test,DNS:*.example.test\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n' > ext.cnf
-openssl x509 -req -in site.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out site.pem -days 300 -extfile ext.cnf
-cat site.pem ca.pem > chain.pem
-cat chain.pem site.key > haproxy.pem
+"$here/certs.sh" "$work/certs/real"
 mkdir -p "$work/www"
 echo '<html><body>stand</body></html>' > "$work/www/index.html"
+head -c 5000000 /dev/urandom > "$work/www/blob5m"
+head -c 1000000 /dev/urandom > "$work/www/blob1m"
 
 for side in new old; do
   eval ref=\$$side

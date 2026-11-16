@@ -122,6 +122,10 @@ import socket, ssl, sys, threading
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(sys.argv[1], sys.argv[2])
 ctx.set_alpn_protocols(["h2", "http/1.1"])
+if len(sys.argv) > 3 and sys.argv[3] == "stateful":
+    # sessions in the server's cache, tickets only their ids: nginx with
+    # ssl_session_tickets off, as Mozilla's settings have it
+    ctx.options |= ssl.OP_NO_TICKET
 srv = socket.socket()
 srv.bind(("127.0.0.1", 0))
 srv.listen(64)
@@ -141,7 +145,7 @@ while True:
 `
 
 // opensslTarget serves TLS with OpenSSL, as nginx does.
-func opensslTarget(t *testing.T) string {
+func opensslTarget(t *testing.T, args ...string) string {
 	t.Helper()
 	bin, err := exec.LookPath("python3")
 	if err != nil {
@@ -156,7 +160,7 @@ func opensslTarget(t *testing.T) string {
 	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "-c", opensslServerPy, certFile, keyFile)
+	cmd := exec.Command(bin, append([]string{"-c", opensslServerPy, certFile, keyFile}, args...)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -427,6 +431,17 @@ func TestResumptionGoTarget(t *testing.T) {
 
 func TestResumptionOpenSSLTarget(t *testing.T) {
 	testResumption(t, opensslTarget(t))
+}
+
+// Tickets too short to carry a session, ids of sessions the server keeps:
+// REALITY issues and keeps such ids too.
+func TestResumptionSessionCacheTarget(t *testing.T) {
+	target := opensslTarget(t, "stateful")
+	testResumption(t, target)
+	shape := reality.LoadTicketShape(target + " " + testServerName + " 2")
+	if shape.TicketLen > 64 {
+		t.Fatalf("the target's tickets are session ids: %d bytes", shape.TicketLen)
+	}
 }
 
 func TestNoResumptionWithoutBrowser(t *testing.T) {

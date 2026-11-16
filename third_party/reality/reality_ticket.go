@@ -11,6 +11,7 @@ import (
 	"io"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/xtls/reality/tls13"
@@ -99,6 +100,12 @@ func (c *Conn) ticketMsgs(shape *TicketShape, recordLen, n int) [][]byte {
 		var label []byte
 		if shape.Resumes {
 			label = c.realityTicketLabel(suite, keys, shape.Prefix, nonce, ticketLen)
+			if label == nil {
+				// Too short to carry the session: an id of it, kept here,
+				// as servers with a session cache issue (nginx with
+				// ssl_session_tickets off).
+				label = c.statefulTicket(suite, shape, nonce, ticketLen)
+			}
 		} else {
 			label = make([]byte, ticketLen)
 			copy(label, shape.Prefix)
@@ -192,7 +199,7 @@ func (hs *serverHandshakeStateTLS13) realityResume(shape *TicketShape) bool {
 	if (shape.FlightRecords == 1) != (c.out.handshakeBuf != nil) || c.out.handshakeLen[2] == 0 {
 		return false
 	}
-	session := c.config.realityTicketSession(shape, ch.pskIdentities[0].label)
+	session := c.config.realityTicketSession(shape, ch.pskIdentities[0].label, false)
 	if session == nil {
 		return false
 	}
@@ -297,17 +304,24 @@ func (hs *serverHandshakeStateTLS13) postHandshakeRecords(lens []int) ([]int, []
 }
 
 // realityTicketSession returns the session in a ticket REALITY issued and
-// that has not expired, or nil.
-func (c *Config) realityTicketSession(shape *TicketShape, label []byte) *SessionState {
+// that has not expired, or nil. A ticket that is an id of a session kept
+// here is taken out when take is set; REALITY keeps them until they
+// expire, as nginx's session cache does: a used one is still refused with
+// a wrong binder there.
+func (c *Config) realityTicketSession(shape *TicketShape, label []byte, take bool) *SessionState {
 	if !bytes.HasPrefix(label, shape.Prefix) {
 		return nil
 	}
-	plaintext := c.decryptTicket(label[len(shape.Prefix):], c.realityTicketKeys())
-	if plaintext == nil {
+	var session *SessionState
+	if plaintext := c.decryptTicket(label[len(shape.Prefix):], c.realityTicketKeys()); plaintext != nil {
+		var err error
+		if session, err = ParseSessionState(plaintext); err != nil {
+			return nil
+		}
+	} else if session = statefulTickets.get(label, take); session == nil {
 		return nil
 	}
-	session, err := ParseSessionState(plaintext)
-	if err != nil || session.version != VersionTLS13 || session.isClient {
+	if session.version != VersionTLS13 || session.isClient {
 		return nil
 	}
 	age := c.time().Sub(time.Unix(int64(session.createdAt), 0))
@@ -347,7 +361,7 @@ func (hs *serverHandshakeStateTLS13) ticketRefusal() *TicketShape {
 	if shape == nil || !shape.Resumes || !shape.RefusesBadBinder {
 		return nil
 	}
-	session := hs.c.config.realityTicketSession(shape, ch.pskIdentities[0].label)
+	session := hs.c.config.realityTicketSession(shape, ch.pskIdentities[0].label, false)
 	if session == nil {
 		return nil
 	}
@@ -359,4 +373,75 @@ func (hs *serverHandshakeStateTLS13) ticketRefusal() *TicketShape {
 		return nil
 	}
 	return shape
+}
+
+// statefulTicket returns a ticket of ticketLen bytes that is only an id of
+// this connection's session, which REALITY keeps for the ticket's lifetime.
+func (c *Conn) statefulTicket(suite *cipherSuiteTLS13, shape *TicketShape, nonce []byte, ticketLen int) []byte {
+	if ticketLen < len(shape.Prefix)+16 {
+		return nil // too short to be unguessable
+	}
+	label := make([]byte, ticketLen)
+	copy(label, shape.Prefix)
+	if _, err := io.ReadFull(c.config.rand(), label[len(shape.Prefix):]); err != nil {
+		return nil
+	}
+	state := c.sessionState()
+	state.secret = tls13.ExpandLabel(suite.hash.New, c.resumptionSecret, "resumption", nonce, suite.hash.Size())
+	statefulTickets.put(label, state, time.Duration(shape.Lifetime)*time.Second)
+	return label
+}
+
+// statefulTickets keeps the sessions of tickets that are ids, as a server's
+// session cache does: in memory, until they expire or are used.
+var statefulTickets = &sessionCache{entries: make(map[string]sessionEntry)}
+
+// sessionCacheSize bounds the sessions kept, as nginx's 10 MB cache of
+// about 40000 does.
+const sessionCacheSize = 40000
+
+type sessionEntry struct {
+	state   *SessionState
+	expires time.Time
+}
+
+type sessionCache struct {
+	sync.Mutex
+	entries map[string]sessionEntry
+}
+
+func (s *sessionCache) put(id []byte, state *SessionState, lifetime time.Duration) {
+	s.Lock()
+	defer s.Unlock()
+	now := time.Now()
+	if len(s.entries) >= sessionCacheSize {
+		for k, e := range s.entries {
+			if now.After(e.expires) {
+				delete(s.entries, k)
+			}
+		}
+		for k := range s.entries {
+			if len(s.entries) < sessionCacheSize {
+				break
+			}
+			delete(s.entries, k)
+		}
+	}
+	s.entries[string(id)] = sessionEntry{state: state, expires: now.Add(lifetime)}
+}
+
+func (s *sessionCache) get(id []byte, take bool) *SessionState {
+	s.Lock()
+	defer s.Unlock()
+	e, ok := s.entries[string(id)]
+	if !ok {
+		return nil
+	}
+	if take || time.Now().After(e.expires) {
+		delete(s.entries, string(id))
+	}
+	if time.Now().After(e.expires) {
+		return nil
+	}
+	return e.state
 }

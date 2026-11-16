@@ -10,7 +10,7 @@
 }
 https://caddy.example.test:443 {
 	bind 10.9.0.12
-	tls @WORK@/certs/chain.pem @WORK@/certs/site.key
+	tls @WORK@/certs/real/ecdsa-chain.pem @WORK@/certs/real/ecdsa.key
 	root * @WORK@/www
 	file_server
 }
