@@ -561,3 +561,17 @@ func TestResumptionHelloFollowsTheBrowser(t *testing.T) {
 		}
 	}
 }
+
+func TestNoTicketOfferedForAWhileAfterOneFailed(t *testing.T) {
+	store := &ticketStore{sessions: make(map[string][]*utls.ClientSessionState)}
+	store.push("k", &utls.ClientSessionState{})
+	store.fail("k")
+	store.push("k", &utls.ClientSessionState{})
+	if store.offer("k") != nil {
+		t.Fatal("no ticket is offered right after one failed")
+	}
+	store.failed["k"] = time.Now().Add(-ticketBackoff - time.Second)
+	if store.offer("k") == nil {
+		t.Fatal("tickets are offered again after the backoff, and those collected meanwhile kept")
+	}
+}

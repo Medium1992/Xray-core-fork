@@ -230,3 +230,33 @@ func TestProbeTicketShapeNoTickets(t *testing.T) {
 		t.Fatalf("a target without tickets has no shape: %+v", shape)
 	}
 }
+
+func TestTicketShapeIsProbedAgain(t *testing.T) {
+	config := &Config{Type: "tcp", Dest: goTarget(t)}
+	key := config.Dest + " example.com 2"
+	DetectTicketShape(config, key, "example.com", 2)
+	waitShape := func(after time.Time) *TicketShape {
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+			if val, _ := GlobalTicketShapes.Load(key); val != nil {
+				if shape, ok := val.(*TicketShape); ok && shape.probed.After(after) {
+					return shape
+				}
+			}
+		}
+		t.Fatal("no shape probed")
+		return nil
+	}
+	old := waitShape(time.Time{})
+	RefreshTicketShape(config, key, "example.com", 2)
+	if val, _ := GlobalTicketShapes.Load(key); val != old {
+		t.Fatal("a fresh shape is not probed again")
+	}
+	stale := *old
+	stale.probed = time.Now().Add(-2 * ticketShapeRefresh)
+	GlobalTicketShapes.Store(key, &stale)
+	start := time.Now()
+	RefreshTicketShape(config, key, "example.com", 2)
+	if fresh := waitShape(start); !fresh.Resumes {
+		t.Fatal("the target resumes")
+	}
+}

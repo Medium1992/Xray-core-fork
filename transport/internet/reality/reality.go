@@ -165,14 +165,16 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	var cache *connTickets
 	if browser {
 		ticketsKey = ticketKey(config, dest, utlsConfig.ServerName)
-		cache = &connTickets{key: ticketsKey, conn: uConn, session: tickets.pop(ticketsKey)}
+		cache = &connTickets{key: ticketsKey, conn: uConn, session: tickets.offer(ticketsKey)}
 		utlsConfig.SessionTicketsDisabled = false
 		utlsConfig.ClientSessionCache = cache
 		utlsConfig.OmitEmptyPsk = true
 		utlsConfig.AlwaysIncludePSK = true
 		utlsConfig.InsecureSkipTimeVerify = true // REALITY's certificate has no validity
 	}
-	if spec := resumptionSpec(*fingerprint); cache != nil && cache.session != nil && spec != nil {
+	// uTLS takes the ticket from the cache when it builds the ClientHello.
+	offered := cache != nil && cache.session != nil
+	if spec := resumptionSpec(*fingerprint); offered && spec != nil {
 		uConn.UConn = utls.UClient(c, utlsConfig, utls.HelloCustom)
 		if err := uConn.ApplyPreset(spec); err != nil {
 			c.Close()
@@ -246,6 +248,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		}
 	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
+		if offered {
+			tickets.fail(ticketsKey)
+		}
 		uConn.Close()
 		return nil, err
 	}
@@ -255,7 +260,11 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 			// handshake, and only verified servers' tickets are kept.
 			uConn.Verified = true
 		} else if !uConn.Verified {
-			tickets.clear(ticketsKey)
+			if offered {
+				tickets.fail(ticketsKey)
+			} else {
+				tickets.clear(ticketsKey)
+			}
 		}
 	}
 	if config.Show {

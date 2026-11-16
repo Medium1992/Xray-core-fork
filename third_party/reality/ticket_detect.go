@@ -63,6 +63,8 @@ type TicketShape struct {
 	ResRecords []int
 	// ResTickets is the number of tickets after a resumed handshake.
 	ResTickets int
+
+	probed time.Time
 }
 
 // ticketRecordOverhead is what a TLS 1.3 record holding a NewSessionTicket
@@ -89,7 +91,38 @@ func DetectTicketShape(config *Config, key, sni string, alpn int) {
 		if shape == nil {
 			shape = &TicketShape{}
 		}
+		shape.probed = time.Now()
 		GlobalTicketShapes.Store(key, shape)
+	}()
+}
+
+// ticketShapeRefresh is how often the target is probed again: a target
+// that restarts may get a new ticket key, and its tickets a new prefix.
+const ticketShapeRefresh = time.Hour
+
+var refreshingTicketShapes sync.Map
+
+// RefreshTicketShape probes the target again for key once the shape is
+// older than ticketShapeRefresh. The old shape stays in use until then,
+// and when the probe fails.
+func RefreshTicketShape(config *Config, key, sni string, alpn int) {
+	val, _ := GlobalTicketShapes.Load(key)
+	shape, ok := val.(*TicketShape)
+	if !ok || time.Since(shape.probed) < ticketShapeRefresh {
+		return
+	}
+	if _, busy := refreshingTicketShapes.LoadOrStore(key, struct{}{}); busy {
+		return
+	}
+	go func() {
+		defer refreshingTicketShapes.Delete(key)
+		fresh, _ := probeTicketShape(config, sni, alpn)
+		if fresh == nil {
+			again := *shape
+			fresh = &again
+		}
+		fresh.probed = time.Now()
+		GlobalTicketShapes.Store(key, fresh)
 	}()
 }
 

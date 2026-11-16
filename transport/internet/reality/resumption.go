@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common/net"
@@ -33,9 +34,45 @@ const (
 
 var tickets = &ticketStore{sessions: make(map[string][]*utls.ClientSessionState)}
 
+// ticketBackoff is how long a client offers no ticket to a server after
+// one failed there, as with a server of an older version behind the same
+// address: it takes the ticket for a stranger's and hands the connection
+// to the target. Tickets are still collected meanwhile.
+const ticketBackoff = 10 * time.Minute
+
 type ticketStore struct {
 	sync.Mutex
 	sessions map[string][]*utls.ClientSessionState
+	failed   map[string]time.Time
+}
+
+// offer takes a ticket to offer to the server, unless one failed there
+// lately.
+func (s *ticketStore) offer(key string) *utls.ClientSessionState {
+	s.Lock()
+	if at, ok := s.failed[key]; ok {
+		if time.Since(at) < ticketBackoff {
+			s.Unlock()
+			return nil
+		}
+		delete(s.failed, key)
+	}
+	s.Unlock()
+	return s.pop(key)
+}
+
+// fail drops the server's tickets and offers none to it for a while.
+func (s *ticketStore) fail(key string) {
+	s.Lock()
+	defer s.Unlock()
+	delete(s.sessions, key)
+	if s.failed == nil {
+		s.failed = make(map[string]time.Time)
+	}
+	if len(s.failed) >= ticketServers {
+		clear(s.failed)
+	}
+	s.failed[key] = time.Now()
 }
 
 func (s *ticketStore) pop(key string) *utls.ClientSessionState {
