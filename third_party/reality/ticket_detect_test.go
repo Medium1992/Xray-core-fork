@@ -1,6 +1,7 @@
 package reality
 
 import (
+	"fmt"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,37 +11,62 @@ import (
 	"encoding/pem"
 	"io"
 	"math/big"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
 
 func testCertificate(t *testing.T, name string) (certPEM, keyPEM []byte) {
 	t.Helper()
+	return testCertPEM, testKeyPEM
+}
+
+var testCertPEM, testKeyPEM []byte
+
+// TestMain makes the test certificate trusted, as a real target's is: the
+// probe of the target's records verifies it.
+func TestMain(m *testing.M) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: name},
-		DNSNames:     []string{name},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "example.com"},
+		DNSNames:              []string{"example.com"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	testCertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	testKeyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	dir, err := os.MkdirTemp("", "reality-test")
+	if err != nil {
+		panic(err)
+	}
+	certFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(certFile, testCertPEM, 0o600); err != nil {
+		panic(err)
+	}
+	os.Setenv("SSL_CERT_FILE", certFile)
+	os.Unsetenv("SSL_CERT_DIR")
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 // goTarget serves TLS with crypto/tls, as Caddy does: one ticket, sent with
@@ -75,14 +101,39 @@ func goTarget(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// opensslTarget serves TLS with openssl s_server, as nginx does: two
-// tickets after a full handshake and one after a resumed one, both after
-// the client's Finished.
+// opensslServerPy is a threaded TLS server on Python's ssl module, which is
+// OpenSSL: two tickets after a full handshake, one after a resumed one, both
+// after the client's Finished, as nginx sends them. openssl s_server would
+// do, but it serves one connection at a time.
+const opensslServerPy = `
+import socket, ssl, sys, threading
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+ctx.set_alpn_protocols(["h2", "http/1.1"])
+srv = socket.socket()
+srv.bind(("127.0.0.1", 0))
+srv.listen(64)
+print(srv.getsockname()[1], flush=True)
+def serve(c):
+    try:
+        s = ctx.wrap_socket(c, server_side=True)
+        while s.recv(4096):
+            pass
+    except Exception:
+        pass
+    finally:
+        c.close()
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+`
+
+// opensslTarget serves TLS with OpenSSL, as nginx does.
 func opensslTarget(t *testing.T) string {
 	t.Helper()
-	bin, err := exec.LookPath("openssl")
+	bin, err := exec.LookPath("python3")
 	if err != nil {
-		t.Skip("openssl is not installed")
+		t.Skip("python3 is not installed")
 	}
 	dir := t.TempDir()
 	certPEM, keyPEM := testCertificate(t, "example.com")
@@ -93,14 +144,11 @@ func opensslTarget(t *testing.T) string {
 	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	cmd := exec.Command(bin, "-c", opensslServerPy, certFile, keyFile)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
-	ln.Close()
-	cmd := exec.Command(bin, "s_server", "-accept", addr, "-cert", certFile, "-key", keyFile,
-		"-alpn", "h2,http/1.1", "-www", "-quiet")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -108,16 +156,11 @@ func opensslTarget(t *testing.T) string {
 		cmd.Process.Kill()
 		cmd.Wait()
 	})
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
-		conn, err := net.Dial("tcp", addr)
-		if err == nil {
-			conn.Close()
-			return addr
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("openssl s_server did not start")
-		}
+	var port int
+	if _, err := fmt.Fscan(stdout, &port); err != nil {
+		t.Skip("python3 has no ssl module: ", err)
 	}
+	return "127.0.0.1:" + strconv.Itoa(port)
 }
 
 func TestProbeTicketShapeGoTarget(t *testing.T) {

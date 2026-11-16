@@ -31,6 +31,8 @@ type Conn struct {
 	ClientTime        time.Time
 	ClientShortId     [8]byte
 	MaxUselessRecords int
+	// realityTickets is set when the client asked for session tickets.
+	realityTickets bool
 	// [REALITY] SECTION END
 
 	// constant
@@ -193,6 +195,8 @@ type halfConn struct {
 	// [REALITY] SECTION: define var
 	handshakeLen [7]int
 	handshakeBuf []byte
+	// ticket keeps a NewSessionTicket one: a real ticket, not a stand-in.
+	ticket bool
 	// [REALITY] SECTION END
 
 	sync.Mutex
@@ -567,8 +571,10 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, err
 				case typeNewSessionTicket:
 					padding = hc.handshakeLen[6]
 					hc.handshakeLen[6] = 0
-					record[5] = byte(recordTypeApplicationData)
-					record[6] = 0
+					if !hc.ticket {
+						record[5] = byte(recordTypeApplicationData)
+						record[6] = 0
+					}
 				}
 				padding -= len(record) + c.Overhead()
 				if padding < 0 {

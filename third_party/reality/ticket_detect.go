@@ -28,13 +28,19 @@ type TicketShape struct {
 	// The other fields are meaningful only when it is true.
 	Resumes bool
 
-	// TicketLen is the length of the target's tickets, as clients send them
-	// back in pre_shared_key.
-	TicketLen int
+	// TicketLen and ResTicketLen are the lengths of the target's tickets
+	// after a full and after a resumed handshake, as clients send them back
+	// in pre_shared_key. OpenSSL's grow with what the session holds.
+	TicketLen    int
+	ResTicketLen int
 	// Prefix is what all of the target's tickets start with, such as the
 	// key name OpenSSL puts first. Tickets that differ there would set
 	// REALITY's apart from the target's.
 	Prefix []byte
+	// NonceLen is the length of the target's ticket_nonce. With it, the
+	// length of a ticket follows from that of its record, which varies
+	// with the target's tickets.
+	NonceLen int
 	// Lifetime is the ticket_lifetime the target announces, in seconds.
 	Lifetime uint32
 	// Tickets is the number of tickets after a full handshake.
@@ -58,6 +64,12 @@ type TicketShape struct {
 	// ResTickets is the number of tickets after a resumed handshake.
 	ResTickets int
 }
+
+// ticketRecordOverhead is what a TLS 1.3 record holding a NewSessionTicket
+// adds to its nonce and ticket: the record header, the AEAD tag, the inner
+// content type, and the message's type, length, lifetime, age_add and
+// length prefixes.
+const ticketRecordOverhead = recordHeaderLen + 16 + 1 + 4 + 4 + 4 + 1 + 2 + 2
 
 const (
 	ticketProbeTimeout = 10 * time.Second
@@ -283,12 +295,20 @@ func probeTicketShape(config *Config, sni string, alpn int) (*TicketShape, error
 		}
 	}
 	shape.TicketLen = len(tickets[0])
-	for _, ticket := range tickets {
-		if len(ticket) != shape.TicketLen {
-			return nil, errors.New("reality: the target's tickets differ in length")
-		}
+	shape.ResTicketLen = shape.TicketLen
+	if len(res.sessions) != 0 {
+		shape.ResTicketLen = len(tickets[len(full.sessions)])
 	}
 	shape.Prefix = commonPrefix(tickets)
+	// The first record after the Finished of the full handshake is its
+	// first ticket.
+	if len(shape.FullRecords) < 5 {
+		return nil, errors.New("reality: tickets not where expected")
+	}
+	shape.NonceLen = shape.FullRecords[4] - ticketRecordOverhead - shape.TicketLen
+	if shape.NonceLen < 0 || shape.NonceLen > 255 {
+		return nil, errors.New("reality: tickets not where expected")
+	}
 
 	if shape.PSKIndex, err = pskExtensionIndex(res.hello.body); err != nil {
 		return nil, err
