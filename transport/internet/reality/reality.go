@@ -160,9 +160,22 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		c.Close()
 		return nil, errors.New("REALITY: failed to get fingerprint")
 	}
+	browser := config.Browser == "auto" && resumesSessions(*fingerprint)
+	var ticketsKey string
+	if browser {
+		ticketsKey = ticketKey(config, dest, utlsConfig.ServerName)
+		utlsConfig.SessionTicketsDisabled = false
+		utlsConfig.ClientSessionCache = &connTickets{key: ticketsKey, conn: uConn}
+		utlsConfig.OmitEmptyPsk = true
+		utlsConfig.AlwaysIncludePSK = true
+		utlsConfig.InsecureSkipTimeVerify = true // REALITY's certificate has no validity
+	}
 	uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
 	{
-		uConn.BuildHandshakeState()
+		if err := uConn.BuildHandshakeState(); err != nil {
+			c.Close()
+			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
+		}
 		if err := tls.FixRandomizedHello(uConn.UConn); err != nil {
 			c.Close()
 			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
@@ -174,6 +187,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		hello.SessionId[1] = core.Version_y
 		hello.SessionId[2] = core.Version_z
 		hello.SessionId[3] = 0 // reserved
+		if browser {
+			hello.SessionId[3] = realityTicketsFlag
+		}
 		binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 		copy(hello.SessionId[8:], config.ShortId)
 		if config.Show {
@@ -204,12 +220,33 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		if config.Show {
 			fmt.Printf("REALITY localAddr: %v\tuConn.AuthKey[:16]: %v\tAEAD: %T\n", localAddr, uConn.AuthKey[:16], aead)
 		}
-		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
+		aad := hello.Raw
+		psk := offeredPSK(uConn.UConn)
+		if psk != nil {
+			aad = pskAAD(hello.Raw, psk.Binders)
+		}
+		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], aad)
 		copy(hello.Raw[39:], hello.SessionId)
+		if psk != nil {
+			// The binders cover the session id written above.
+			if err := psk.PatchBuiltHello(hello); err != nil && err != io.EOF {
+				c.Close()
+				return nil, errors.New("REALITY: failed to bind the ticket").Base(err)
+			}
+		}
 	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		uConn.Close()
 		return nil, err
+	}
+	if browser {
+		if uConn.ConnectionState().DidResume {
+			// Only the server that issued the ticket completes this
+			// handshake, and only verified servers' tickets are kept.
+			uConn.Verified = true
+		} else if !uConn.Verified {
+			tickets.clear(ticketsKey)
+		}
 	}
 	if config.Show {
 		fmt.Printf("REALITY localAddr: %v\tuConn.Verified: %v\n", localAddr, uConn.Verified)

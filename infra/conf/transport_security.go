@@ -50,6 +50,7 @@ type REALITYConfig struct {
 	ShortId       string `json:"shortId"`
 	Mldsa65Verify string `json:"mldsa65Verify"`
 	SpiderX       string `json:"spiderX"`
+	Browser       string `json:"browser"`
 }
 
 func (c *REALITYConfig) Build() (proto.Message, error) {
@@ -188,6 +189,13 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 		}
 		if len(c.ServerNames) != 0 {
 			return nil, errors.New(`non-empty "serverNames", please use "serverName" instead`)
+		}
+		switch strings.ToLower(c.Browser) {
+		case "", "off":
+		case "auto":
+			config.Browser = "auto"
+		default:
+			return nil, errors.New(`invalid "browser": `, c.Browser)
 		}
 		if c.Password != "" {
 			c.PublicKey = c.Password
