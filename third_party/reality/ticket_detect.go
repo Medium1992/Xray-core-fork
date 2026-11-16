@@ -78,7 +78,8 @@ const (
 	ticketProbeWait = 3 * time.Second
 )
 
-// DetectTicketShape probes the target once for key, see DetectPostHandshakeRecordsLens.
+// DetectTicketShape probes the target once for key. DetectPostHandshakeRecordsLens
+// starts it with the other probes, so that the first clients get tickets too.
 func DetectTicketShape(config *Config, key, sni string, alpn int) {
 	if _, loaded := GlobalTicketShapes.LoadOrStore(key, false); loaded {
 		return

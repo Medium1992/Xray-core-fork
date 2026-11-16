@@ -77,16 +77,20 @@ func (s *ticketStore) clear(key string) {
 	delete(s.sessions, key)
 }
 
-// connTickets is the ClientSessionCache of one connection. uTLS asks it for
-// a ticket while building the ClientHello and puts the tickets the server
-// sends; only those of a verified connection are kept.
+// connTickets is the ClientSessionCache of one connection. It holds the
+// ticket the connection offers, taken from the store before the
+// ClientHello is built, since the ClientHello depends on it; uTLS puts the
+// tickets the server sends, and only those of a verified connection are
+// kept.
 type connTickets struct {
-	key  string
-	conn *UConn
+	key     string
+	conn    *UConn
+	session *utls.ClientSessionState
 }
 
 func (c *connTickets) Get(string) (*utls.ClientSessionState, bool) {
-	session := tickets.pop(c.key)
+	session := c.session
+	c.session = nil
 	return session, session != nil
 }
 
@@ -98,6 +102,28 @@ func (c *connTickets) Put(_ string, session *utls.ClientSessionState) {
 	if c.conn.Verified {
 		tickets.push(c.key, session)
 	}
+}
+
+// resumptionSpec returns the ClientHello of fingerprint as its browser
+// sends it when it offers a ticket, or nil when that is the ClientHello of
+// fingerprint plus pre_shared_key. Firefox drops the empty session_ticket
+// extension then.
+func resumptionSpec(fingerprint utls.ClientHelloID) *utls.ClientHelloSpec {
+	if fingerprint.Client != "Firefox" {
+		return nil
+	}
+	spec, err := utls.UTLSIdToSpec(fingerprint)
+	if err != nil {
+		return nil
+	}
+	extensions := make([]utls.TLSExtension, 0, len(spec.Extensions))
+	for _, extension := range spec.Extensions {
+		if _, ok := extension.(utls.ISessionTicketExtension); !ok {
+			extensions = append(extensions, extension)
+		}
+	}
+	spec.Extensions = extensions
+	return &spec
 }
 
 // ticketKey names the tickets of one REALITY server as one outbound sees it.

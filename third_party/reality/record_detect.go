@@ -24,6 +24,7 @@ func DetectPostHandshakeRecordsLens(config *Config) {
 	for sni := range config.ServerNames {
 		for alpn := range 3 { // 0, 1, 2
 			key := config.Dest + " " + sni + " " + strconv.Itoa(alpn)
+			DetectTicketShape(config, key, sni, alpn)
 			if _, loaded := GlobalPostHandshakeRecordsLens.LoadOrStore(key, false); !loaded {
 				go func() {
 					defer func() {

@@ -162,15 +162,25 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	}
 	browser := config.Browser == "auto" && resumesSessions(*fingerprint)
 	var ticketsKey string
+	var cache *connTickets
 	if browser {
 		ticketsKey = ticketKey(config, dest, utlsConfig.ServerName)
+		cache = &connTickets{key: ticketsKey, conn: uConn, session: tickets.pop(ticketsKey)}
 		utlsConfig.SessionTicketsDisabled = false
-		utlsConfig.ClientSessionCache = &connTickets{key: ticketsKey, conn: uConn}
+		utlsConfig.ClientSessionCache = cache
 		utlsConfig.OmitEmptyPsk = true
 		utlsConfig.AlwaysIncludePSK = true
 		utlsConfig.InsecureSkipTimeVerify = true // REALITY's certificate has no validity
 	}
-	uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
+	if spec := resumptionSpec(*fingerprint); cache != nil && cache.session != nil && spec != nil {
+		uConn.UConn = utls.UClient(c, utlsConfig, utls.HelloCustom)
+		if err := uConn.ApplyPreset(spec); err != nil {
+			c.Close()
+			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
+		}
+	} else {
+		uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
+	}
 	{
 		if err := uConn.BuildHandshakeState(); err != nil {
 			c.Close()

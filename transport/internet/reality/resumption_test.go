@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -246,8 +247,33 @@ func startRealityServer(t *testing.T, target string) *realityServer {
 // recordCapture keeps the record lengths the server sends.
 type recordCapture struct {
 	gonet.Conn
-	mu sync.Mutex
-	in []byte
+	mu  sync.Mutex
+	in  []byte
+	out []byte
+}
+
+func (c *recordCapture) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	c.out = append(c.out, b...)
+	c.mu.Unlock()
+	return c.Conn.Write(b)
+}
+
+// helloExtensions returns the extension types of the ClientHello sent.
+func (c *recordCapture) helloExtensions() []uint16 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.out[5:] // record header
+	p := 4 + 2 + 32
+	p += 1 + int(b[p])
+	p += 2 + int(binary.BigEndian.Uint16(b[p:]))
+	p += 1 + int(b[p])
+	end := p + 2 + int(binary.BigEndian.Uint16(b[p:]))
+	var types []uint16
+	for p += 2; p < end; p += 4 + int(binary.BigEndian.Uint16(b[p+2:])) {
+		types = append(types, binary.BigEndian.Uint16(b[p:]))
+	}
+	return types
 }
 
 func (c *recordCapture) Read(b []byte) (int, error) {
@@ -276,6 +302,7 @@ func (c *recordCapture) records() []int {
 type dialResult struct {
 	conn    *UConn
 	records []int // up to and including the echo
+	hello   []uint16
 }
 
 func dialReality(t *testing.T, server *realityServer, browser string) dialResult {
@@ -318,7 +345,7 @@ func dialRealityAs(t *testing.T, server *realityServer, browser, fingerprint str
 	if _, err := io.ReadFull(uConn, reply); err != nil || string(reply) != "ping" {
 		t.Fatalf("echo %q: %v", reply, err)
 	}
-	return dialResult{conn: uConn, records: capture.records()}
+	return dialResult{conn: uConn, records: capture.records(), hello: capture.helloExtensions()}
 }
 
 func testResumption(t *testing.T, target string) {
@@ -509,5 +536,28 @@ func TestPSKFingerprintFailsWithoutPanic(t *testing.T) {
 	}
 	if _, err := UClient(raw, config, context.Background(), net.TCPDestination(net.LocalHostIP, 443)); err == nil {
 		t.Fatal("the ClientHello cannot be built")
+	}
+}
+
+// Firefox drops the empty session_ticket extension when it offers a ticket;
+// Chrome keeps it. pre_shared_key comes last in both.
+func TestResumptionHelloFollowsTheBrowser(t *testing.T) {
+	server := startRealityServer(t, goTarget(t))
+	for fingerprint, keepsSessionTicket := range map[string]bool{"firefox": false, "chrome": true} {
+		full := dialRealityAs(t, server, "auto", fingerprint)
+		resumed := dialRealityAs(t, server, "auto", fingerprint)
+		if !resumed.conn.ConnectionState().DidResume {
+			t.Fatalf("%s: the second connection resumes", fingerprint)
+		}
+		has := func(types []uint16, want uint16) bool { return slices.Contains(types, want) }
+		if !has(full.hello, 35) || has(full.hello, 41) {
+			t.Fatalf("%s: full ClientHello %v", fingerprint, full.hello)
+		}
+		if resumed.hello[len(resumed.hello)-1] != 41 || has(resumed.hello, 35) != keepsSessionTicket {
+			t.Fatalf("%s: resumed ClientHello %v", fingerprint, resumed.hello)
+		}
+		if !keepsSessionTicket && len(resumed.hello) != len(full.hello) {
+			t.Fatalf("%s: pre_shared_key takes session_ticket's place: %v, %v", fingerprint, full.hello, resumed.hello)
+		}
 	}
 }
