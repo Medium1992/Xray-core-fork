@@ -141,6 +141,13 @@ unshare -Urnm python3 stand.py xhttp-off nginx
 python3 compare.py --xhttp-off <legacy-run> <current-run>
 ```
 
+`xhttp-off-legacy` runs the current client against the old server.
+`xhttp-off-old-client` runs the old client against the current server.
+Compare the latter with `xhttp-off-old-both` to keep the client build
+fixed across runs. Use `xhttp-off-auto-server` to check that the
+current server also preserves the startup of an off client when the
+inbound enables browser mode. Compare that run with `xhttp-off-legacy`.
+
 To inspect the decoded records using the scenario's key log:
 
 ```sh
