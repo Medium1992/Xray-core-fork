@@ -116,10 +116,27 @@ def same_shape(a, b):
     return True
 
 
+def resumed(stream):
+    """Whether the server resumed: a ticket was offered and its flight
+    carries no certificate. A ticket the server refused leaves a full
+    handshake, which is compared as one."""
+    if not stream["ch"] or not stream["ch"]["psk_identities"]:
+        return False
+    flight = []
+    for r in stream["records"]:
+        if r["dir"] == "c>s" and "Fin" in r.get("hs", []):
+            break
+        if r["dir"] == "s>c":
+            flight += tag(r).split("+")
+    if "SH" not in flight:
+        return True  # not decrypted: as offered
+    return "Cert" not in flight
+
+
 def split(streams):
-    full = [s for s in streams if s["ch"] and not s["ch"]["psk_identities"]]
-    resumed = [s for s in streams if s["ch"] and s["ch"]["psk_identities"]]
-    return full, resumed
+    full = [s for s in streams if s["ch"] and not resumed(s)]
+    res = [s for s in streams if s["ch"] and resumed(s)]
+    return full, res
 
 
 def fmt(shape):
@@ -160,10 +177,9 @@ def compare(ref_run, our_run, browser, target, ref_name=None):
     # Time from the ServerHello to the client's Finished of full handshakes,
     # over that of resumed ones: the browser verifying the certificate.
     def verify_ms(streams):
-        full = [s["timing"]["client_fin"] - s["timing"]["sh"] for s in streams
-                if s["ch"] and not s["ch"]["psk_identities"] and "client_fin" in s.get("timing", {}) and "sh" in s["timing"]]
-        res = sorted(s["timing"]["client_fin"] - s["timing"]["sh"] for s in streams
-                     if s["ch"] and s["ch"]["psk_identities"] and "client_fin" in s.get("timing", {}) and "sh" in s["timing"])
+        timed = [s for s in streams if s["ch"] and "client_fin" in s.get("timing", {}) and "sh" in s["timing"]]
+        full = [s["timing"]["client_fin"] - s["timing"]["sh"] for s in timed if not resumed(s)]
+        res = sorted(s["timing"]["client_fin"] - s["timing"]["sh"] for s in timed if resumed(s))
         if not full or not res:
             return None
         base = res[len(res) // 2]
@@ -185,24 +201,40 @@ def compare(ref_run, our_run, browser, target, ref_name=None):
         check("psk", a == b, f"ref {a} ours {b}")
         a, b = server_shape(rr[0]), server_shape(orr[0])
         check("resumed", same_shape(a, b), f"ref  {fmt(a)}\n             ours {fmt(b)}")
-    else:
+    elif rr or orr:
         check("resumed", False, f"reference resumed {len(rr)}, ours {len(orr)}")
+    else:
+        check("resumed", True, "neither resumes")  # a target that refuses its tickets
     return checks
 
 
+PAIRS = (("chrome", "chrome"), ("edge", "edge"), ("firefox", "firefox156"), ("firefox", "firefox160"))
+
+
 def main():
+    """Exits 1 when anything differs, or a reference has no capture of ours."""
     ref_run, our_run = sys.argv[1], sys.argv[2]
     failed = 0
-    targets = sorted({d[len("xray-chrome-"):] for d in os.listdir(our_run) if d.startswith("xray-chrome-")})
-    for target in targets:
-        for browser, ref_name in (("chrome", "chrome"), ("edge", "edge"), ("firefox", "firefox156"), ("firefox", "firefox160")):
+    targets = set()
+    for run, prefixes in ((ref_run, {r for _, r in PAIRS}), (our_run, {f"xray-{b}" for b, _ in PAIRS})):
+        for d in os.listdir(run):
+            for prefix in prefixes:
+                if d.startswith(prefix + "-"):
+                    targets.add(d[len(prefix) + 1:])
+    for target in sorted(targets):
+        for browser, ref_name in PAIRS:
             if not os.path.isdir(f"{ref_run}/{ref_name}-{target}"):
                 continue
             print(f"== {browser} via {target}, reference {ref_name}")
+            if not os.path.isdir(f"{our_run}/xray-{browser}-{target}"):
+                failed += 1
+                print(f"  DIFF {'capture':14s} no xray-{browser}-{target} in {our_run}")
+                continue
             for name, ok, detail in compare(ref_run, our_run, browser, target, ref_name):
                 failed += not ok
                 print(f"  {'ok  ' if ok else 'DIFF'} {name:14s}" + (f" {detail}" if detail and not ok else ""))
     print(f"{failed} differences")
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
