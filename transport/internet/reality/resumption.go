@@ -2,6 +2,7 @@ package reality
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"math/rand/v2"
 	"encoding/hex"
 	"slices"
@@ -196,9 +197,14 @@ func pskExtensionLen(session *utls.ClientSessionState) (int, bool) {
 }
 
 // ticketKey names the tickets of one REALITY server as one outbound sees it.
+//
+// The ML-DSA-65 key is part of it: a resumed handshake carries no
+// certificate to check it against, so an outbound that requires it may only
+// resume with tickets from handshakes that checked it.
 func ticketKey(config *Config, dest net.Destination, serverName string) string {
+	mldsa := sha256.Sum256(config.Mldsa65Verify)
 	return dest.NetAddr() + " " + serverName + " " + hex.EncodeToString(config.PublicKey) + " " +
-		hex.EncodeToString(config.ShortId) + " " + config.Fingerprint
+		hex.EncodeToString(config.ShortId) + " " + config.Fingerprint + " " + hex.EncodeToString(mldsa[:8])
 }
 
 // resumesSessions reports whether the browser of fingerprint resumes

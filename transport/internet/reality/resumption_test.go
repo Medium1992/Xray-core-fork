@@ -713,3 +713,35 @@ func TestVerifyDelayOncePerServer(t *testing.T) {
 		t.Fatal("no delay for fingerprints not measured")
 	}
 }
+
+// An outbound that requires ML-DSA-65 does not resume with a ticket another
+// outbound to the same server got without it: the server has no ML-DSA
+// key, and only a full handshake would have shown that.
+func TestResumptionKeepsTheMldsa65Policy(t *testing.T) {
+	server := startRealityServer(t, goTarget(t))
+	dialReality(t, server, "auto") // a ticket, without ML-DSA
+	raw, err := gonet.Dial("tcp", server.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	host, portStr, _ := gonet.SplitHostPort(server.addr)
+	port, _ := strconv.Atoi(portStr)
+	strict := &Config{
+		Fingerprint:   "chrome",
+		ServerName:    testServerName,
+		PublicKey:     server.public,
+		ShortId:       make([]byte, 8),
+		SpiderY:       make([]int64, 10),
+		Browser:       "auto",
+		Mldsa65Verify: make([]byte, 1952),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := UClient(raw, strict, ctx, net.TCPDestination(net.ParseAddress(host), net.Port(port)))
+	if err == nil {
+		resumed := conn.(*UConn).ConnectionState().DidResume
+		conn.Close()
+		t.Fatalf("the ML-DSA-65 outbound connected (resumed %v) to a server without the key", resumed)
+	}
+}
