@@ -2,6 +2,7 @@ package reality
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/aes"
 	"crypto/hkdf"
 	"crypto/hmac"
@@ -318,7 +319,7 @@ func (c *Config) realityTicketSession(shape *TicketShape, label []byte, take boo
 		if session, err = ParseSessionState(plaintext); err != nil {
 			return nil
 		}
-	} else if session = statefulTickets.get(label, take); session == nil {
+	} else if session = statefulTickets.get(c, label, take); session == nil {
 		return nil
 	}
 	if session.version != VersionTLS13 || session.isClient {
@@ -388,60 +389,74 @@ func (c *Conn) statefulTicket(suite *cipherSuiteTLS13, shape *TicketShape, nonce
 	}
 	state := c.sessionState()
 	state.secret = tls13.ExpandLabel(suite.hash.New, c.resumptionSecret, "resumption", nonce, suite.hash.Size())
-	statefulTickets.put(label, state, time.Duration(shape.Lifetime)*time.Second)
+	statefulTickets.put(c.config, label, state, time.Duration(shape.Lifetime)*time.Second)
 	return label
 }
 
 // statefulTickets keeps the sessions of tickets that are ids, as a server's
-// session cache does: in memory, until they expire or are used.
-var statefulTickets = &sessionCache{entries: make(map[string]sessionEntry)}
+// session cache does: in memory, until they expire, the oldest dropped when
+// it is full. Entries belong to the private key that issued them: a server
+// with another key does not find them.
+var statefulTickets = newSessionCache(sessionCacheSize)
 
 // sessionCacheSize bounds the sessions kept, as nginx's 10 MB cache of
 // about 40000 does.
 const sessionCacheSize = 40000
 
 type sessionEntry struct {
+	key     string
 	state   *SessionState
 	expires time.Time
 }
 
 type sessionCache struct {
 	sync.Mutex
-	entries map[string]sessionEntry
+	size    int
+	entries map[string]*list.Element
+	order   list.List // oldest first
 }
 
-func (s *sessionCache) put(id []byte, state *SessionState, lifetime time.Duration) {
+func newSessionCache(size int) *sessionCache {
+	return &sessionCache{size: size, entries: make(map[string]*list.Element)}
+}
+
+// cacheKey scopes id to the private key of config.
+func cacheKey(config *Config, id []byte) string {
+	scope := sha256.Sum256(config.PrivateKey.Bytes())
+	return string(scope[:16]) + string(id)
+}
+
+func (s *sessionCache) put(config *Config, id []byte, state *SessionState, lifetime time.Duration) {
 	s.Lock()
 	defer s.Unlock()
-	now := time.Now()
-	if len(s.entries) >= sessionCacheSize {
-		for k, e := range s.entries {
-			if now.After(e.expires) {
-				delete(s.entries, k)
-			}
-		}
-		for k := range s.entries {
-			if len(s.entries) < sessionCacheSize {
-				break
-			}
-			delete(s.entries, k)
-		}
+	key := cacheKey(config, id)
+	if e, ok := s.entries[key]; ok {
+		s.order.Remove(e)
 	}
-	s.entries[string(id)] = sessionEntry{state: state, expires: now.Add(lifetime)}
+	s.entries[key] = s.order.PushBack(&sessionEntry{key: key, state: state, expires: time.Now().Add(lifetime)})
+	for s.order.Len() > s.size {
+		oldest := s.order.Front()
+		s.order.Remove(oldest)
+		delete(s.entries, oldest.Value.(*sessionEntry).key)
+	}
 }
 
-func (s *sessionCache) get(id []byte, take bool) *SessionState {
+func (s *sessionCache) get(config *Config, id []byte, take bool) *SessionState {
 	s.Lock()
 	defer s.Unlock()
-	e, ok := s.entries[string(id)]
+	key := cacheKey(config, id)
+	e, ok := s.entries[key]
 	if !ok {
 		return nil
 	}
-	if take || time.Now().After(e.expires) {
-		delete(s.entries, string(id))
+	entry := e.Value.(*sessionEntry)
+	expired := time.Now().After(entry.expires)
+	if take || expired {
+		s.order.Remove(e)
+		delete(s.entries, key)
 	}
-	if time.Now().After(e.expires) {
+	if expired {
 		return nil
 	}
-	return e.state
+	return entry.state
 }
