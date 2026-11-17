@@ -3,6 +3,7 @@ package reality
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"math/rand/v2"
 	"encoding/hex"
 	"slices"
@@ -60,7 +61,33 @@ func (s *ticketStore) offer(key string) *utls.ClientSessionState {
 		delete(s.failed, key)
 	}
 	s.Unlock()
-	return s.pop(key)
+	for {
+		session := s.pop(key)
+		if session == nil || usableTicket(session) {
+			return session
+		}
+	}
+}
+
+// usableTicket is usable, but for tests of the store.
+var usableTicket = usable
+
+// usable reports whether uTLS will offer session: a TLS 1.3 session whose
+// use-by time has not passed. The ClientHello is chosen by the ticket
+// offered (Firefox's differs), so one uTLS would drop builds a resumption's
+// ClientHello without its pre_shared_key.
+func usable(session *utls.ClientSessionState) bool {
+	_, state, err := session.ResumptionState()
+	if err != nil || state == nil {
+		return false
+	}
+	b, err := state.Bytes()
+	// version, then the client's use_by and age_add end the encoding
+	if err != nil || len(b) < 2+12 || binary.BigEndian.Uint16(b) != utls.VersionTLS13 {
+		return false
+	}
+	useBy := time.Unix(int64(binary.BigEndian.Uint64(b[len(b)-12:])), 0)
+	return time.Now().Before(useBy)
 }
 
 // fail drops the server's tickets and offers none to it for a while.

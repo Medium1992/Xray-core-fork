@@ -613,6 +613,8 @@ func TestResumptionHelloFollowsTheBrowser(t *testing.T) {
 }
 
 func TestNoTicketOfferedForAWhileAfterOneFailed(t *testing.T) {
+	defer func(f func(*utls.ClientSessionState) bool) { usableTicket = f }(usableTicket)
+	usableTicket = func(*utls.ClientSessionState) bool { return true }
 	store := &ticketStore{sessions: make(map[string][]*utls.ClientSessionState)}
 	store.push("k", &utls.ClientSessionState{})
 	store.fail("k")
@@ -743,5 +745,58 @@ func TestResumptionKeepsTheMldsa65Policy(t *testing.T) {
 		resumed := conn.(*UConn).ConnectionState().DidResume
 		conn.Close()
 		t.Fatalf("the ML-DSA-65 outbound connected (resumed %v) to a server without the key", resumed)
+	}
+}
+
+// expire returns session with its use-by time, the last 12 bytes but the
+// age add of a TLS 1.3 client session's encoding, in the past.
+func expire(t *testing.T, session *utls.ClientSessionState) *utls.ClientSessionState {
+	t.Helper()
+	ticket, state, err := session.ResumptionState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := state.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint64(b[len(b)-12:], uint64(time.Now().Add(-time.Minute).Unix()))
+	parsed, err := utls.ParseSessionState(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, err := utls.NewResumptionState(ticket, parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return expired
+}
+
+// An expired ticket is not offered, and Firefox's full ClientHello goes out
+// as it is, session_ticket and GREASE ECH included: not the ClientHello of
+// a resumption without its pre_shared_key.
+func TestExpiredTicketLeavesTheFullClientHello(t *testing.T) {
+	server := startRealityServer(t, goTarget(t))
+	full := dialRealityAs(t, server, "auto", "firefox")
+	host, portStr, _ := gonet.SplitHostPort(server.addr)
+	port, _ := strconv.Atoi(portStr)
+	key := ticketKey(&Config{Fingerprint: "firefox", PublicKey: server.public, ShortId: make([]byte, 8)},
+		net.TCPDestination(net.ParseAddress(host), net.Port(port)), testServerName)
+	var expired []*utls.ClientSessionState
+	for session := tickets.pop(key); session != nil; session = tickets.pop(key) {
+		expired = append(expired, expire(t, session))
+	}
+	if len(expired) == 0 {
+		t.Fatal("no tickets")
+	}
+	for _, session := range expired {
+		tickets.push(key, session)
+	}
+	again := dialRealityAs(t, server, "auto", "firefox")
+	if again.conn.ConnectionState().DidResume || slices.Contains(again.hello, 41) {
+		t.Fatal("an expired ticket is not offered")
+	}
+	if !slices.Equal(again.hello, full.hello) || !slices.Equal(again.helloLens, full.helloLens) {
+		t.Fatalf("the full ClientHello %v %v, want Firefox's %v %v", again.hello, again.helloLens, full.hello, full.helloLens)
 	}
 }
