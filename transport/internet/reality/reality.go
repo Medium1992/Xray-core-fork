@@ -139,6 +139,15 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 	return nil
 }
 
+// UsesBrowserProfile reports whether the client requests browser behavior.
+func (c *Config) UsesBrowserProfile() bool {
+	if c == nil || c.Browser != "auto" {
+		return false
+	}
+	fingerprint := tls.GetFingerprint(c.Fingerprint)
+	return fingerprint != nil && resumesSessions(*fingerprint)
+}
+
 func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{

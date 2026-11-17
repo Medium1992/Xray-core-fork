@@ -270,7 +270,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				copy(hs.c.ClientVer[:], plainText)
 				hs.c.ClientTime = time.Unix(int64(binary.BigEndian.Uint32(plainText[4:])), 0)
 				copy(hs.c.ClientShortId[:], plainText[8:])
-				hs.c.realityTickets = plainText[3]&realityTicketsFlag != 0
+				hs.c.realityTickets = config.BrowserMode && plainText[3]&realityTicketsFlag != 0
 				if config.Show {
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientVer: %v\n", remoteAddr, hs.c.ClientVer)
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
@@ -289,7 +289,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			}
 			break
 		}
-		if hs.clientHello != nil && hs.c.vers == VersionTLS13 && config.ServerNames[hs.clientHello.serverName] {
+		if config.BrowserMode && hs.clientHello != nil && hs.c.vers == VersionTLS13 && config.ServerNames[hs.clientHello.serverName] {
 			hs.refusal = hs.ticketRefusal()
 		}
 		mutex.Unlock()
@@ -451,13 +451,16 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				break
 			}
 			for {
-				key, _ := recordsKey(config, hs.clientHello)
+				key, alpn := recordsKey(config, hs.clientHello)
 				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
 					if postHandshakeRecordsLens, ok := val.([]int); ok {
+						if hs.c.realityTickets && config.AppRecords && alpn == 2 {
+							hs.c.h2Startup = detectH2Startup(config, key, hs.clientHello.serverName).
+								records(hs.usingPSK, hasFirefoxH2Fingerprint(hs.clientHello))
+						}
 						lens, tickets := hs.postHandshakeRecords(postHandshakeRecordsLens)
 						for i, length := range lens {
-							if config.AppRecords && tickets[i] == 0 {
-								hs.c.out.appPad = append(hs.c.out.appPad, length)
+							if len(hs.c.h2Startup) != 0 && tickets[i] == 0 {
 								continue
 							}
 							if tickets[i] > 0 {

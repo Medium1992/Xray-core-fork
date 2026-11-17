@@ -57,6 +57,13 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 	config := new(reality.Config)
 	config.MasterKeyLog = c.MasterKeyLog
 	config.Show = c.Show
+	switch strings.ToLower(c.Browser) {
+	case "", "off":
+	case "auto":
+		config.Browser = "auto"
+	default:
+		return nil, errors.New(`invalid "browser": `, c.Browser)
+	}
 	var err error
 	if c.Target != nil {
 		c.Dest = c.Target
@@ -189,13 +196,6 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 		}
 		if len(c.ServerNames) != 0 {
 			return nil, errors.New(`non-empty "serverNames", please use "serverName" instead`)
-		}
-		switch strings.ToLower(c.Browser) {
-		case "", "off":
-		case "auto":
-			config.Browser = "auto"
-		default:
-			return nil, errors.New(`invalid "browser": `, c.Browser)
 		}
 		if c.Password != "" {
 			c.PublicKey = c.Password

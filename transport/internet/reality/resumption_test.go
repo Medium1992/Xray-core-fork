@@ -1,7 +1,6 @@
 package reality
 
 import (
-	"fmt"
 	"bytes"
 	"context"
 	"crypto/ecdh"
@@ -13,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	gonet "net"
@@ -199,6 +199,7 @@ func startRealityServer(t *testing.T, target string) *realityServer {
 		ServerNames: []string{testServerName},
 		PrivateKey:  priv.Bytes(),
 		ShortIds:    [][]byte{make([]byte, 8)},
+		Browser:     "auto",
 	}).GetREALITYConfig()
 	config.Show = os.Getenv("REALITY_SHOW") != ""
 	reality.DetectPostHandshakeRecordsLens(config)

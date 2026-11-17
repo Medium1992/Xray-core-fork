@@ -606,11 +606,13 @@ type Config struct {
 
 	Mldsa65Key *mldsa.PrivateKey
 
-	// AppRecords is set when the application sends, after the handshake,
-	// what the target sends there itself, such as HTTP/2's SETTINGS:
-	// REALITY then sends only the tickets, and pads the application's first
-	// records to the lengths of the target's instead of sending records of
-	// its own.
+	// BrowserMode enables target probes and browser behavior for clients
+	// that request it in their authenticated REALITY handshake.
+	BrowserMode bool
+
+	// AppRecords enables an HTTP/2 startup profile for the application.
+	// When the profile is available, the application writes the startup
+	// records and REALITY sends the new session ticket records.
 	AppRecords bool
 
 	LimitFallbackUpload   LimitFallback
@@ -1069,6 +1071,8 @@ func (c *Config) Clone() *Config {
 		ShortIds:              c.ShortIds,
 		AllowX25519:           c.AllowX25519,
 		Mldsa65Key:            c.Mldsa65Key,
+		BrowserMode:           c.BrowserMode,
+		AppRecords:            c.AppRecords,
 		LimitFallbackUpload:   c.LimitFallbackUpload,
 		LimitFallbackDownload: c.LimitFallbackDownload,
 		// [REALITY] SECTION END
