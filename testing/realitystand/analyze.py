@@ -71,14 +71,42 @@ def records_of(tls):
     return recs
 
 
+def h2_startup(chunks):
+    """Server record lengths and control frame order through SETTINGS ACK."""
+    before, lengths, controls = [], [], []
+    for records, frames in chunks:
+        if not controls and "SETTINGS" not in frames:
+            before.extend(records)
+            continue
+        if not records:
+            return None
+        lengths.extend(records)
+        controls.extend(frame for frame in frames if frame in ("SETTINGS", "WINDOW_UPDATE", "ACK"))
+        if "ACK" in frames:
+            return {"lengths": lengths, "controls": controls, "before": before}
+    return None
+
+
+def h2_frames(layer):
+    for part in as_list(layer):
+        for frame in as_list(part.get("http2.stream")):
+            kind = frame.get("http2.type")
+            if kind == "4":
+                yield "ACK" if int(frame["http2.flags"], 0) & 1 else "SETTINGS"
+            elif kind == "8" and frame.get("http2.streamid") == "0":
+                yield "WINDOW_UPDATE"
+            else:
+                yield kind
+
+
 def analyze(scenario_dir):
     pcap = f"{scenario_dir}/capture.pcap"
     keylog = f"{scenario_dir}/keylog"
-    cmd = ["tshark", "-r", pcap, "-T", "json", "--no-duplicate-keys", "-Y", "tls", "-J", "frame tcp tls ip"]
+    cmd = ["tshark", "-r", pcap, "-T", "json", "--no-duplicate-keys", "-Y", "tls", "-J", "frame tcp tls http2 ip"]
     if os.path.exists(keylog):
         cmd[3:3] = ["-o", f"tls.keylog_file:{keylog}"]
-    out = subprocess.run(cmd, env=ENV, capture_output=True, text=True).stdout
-    frames = json.loads(out or "[]")
+    out = subprocess.run(cmd, env=ENV, capture_output=True, text=True, check=True).stdout
+    frames = json.loads(out)
     streams = {}
     for fr in frames:
         layers = fr["_source"]["layers"]
@@ -87,7 +115,9 @@ def analyze(scenario_dir):
         sport = int(tcp.get("tcp.srcport", 0))
         direction = "s>c" if sport == 443 else "c>s"
         t = float(layers.get("frame", {}).get("frame.time_relative", 0) or 0)
-        st = streams.setdefault(stream, {"stream": stream, "records": [], "ch": None})
+        st = streams.setdefault(stream, {"stream": stream, "records": [], "ch": None,
+                                         "server_psk_selected": None, "h2_chunks": []})
+        h2_records = []
         for rec in records_of(layers.get("tls")):
             if not isinstance(rec, dict):
                 continue
@@ -99,6 +129,11 @@ def analyze(scenario_dir):
                 item["hs"] = hs_types
             st["records"].append(item)
             item["t"] = round(t, 4)
+            if direction == "s>c":
+                if "SH" in hs_types:
+                    st["server_psk_selected"] = bool(walk(rec, "tls.handshake.extensions.psk.identity.selected"))
+                if rec.get("tls.app_data_proto") == "HyperText Transfer Protocol 2":
+                    h2_records.append(length)
             if "CH" in hs_types and st["ch"] is None:
                 exts = [int(x) for x in walk(rec, "tls.handshake.extension.type")]
                 st["ch"] = {
@@ -112,8 +147,11 @@ def analyze(scenario_dir):
                     "ext_lens": [int(x) for x in walk(rec, "tls.handshake.extension.len")],
                     "detail": {name: [str(v) for v in walk(rec, field)] for name, field in HELLO_FIELDS.items()},
                 }
+        if direction == "s>c" and (h2_records or "http2" in layers):
+            st["h2_chunks"].append((h2_records, list(h2_frames(layers.get("http2")))))
     for st in streams.values():
         st["timing"] = timing(st["records"])
+        st["h2_startup"] = h2_startup(st.pop("h2_chunks"))
     result = [streams[k] for k in sorted(streams)]
     with open(f"{scenario_dir}/analysis.json", "w") as f:
         json.dump(result, f, indent=1)

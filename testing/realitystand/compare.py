@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""compare.py <reference-run> <xray-run>: does REALITY look like the target?
+"""compare.py [--xhttp | --xhttp-off] <reference-run> <xray-run>: compare captures.
 
 For each target and browser, the browser's connections straight to the
 target (reference) against the Xray client's through REALITY (ours), on what
@@ -29,8 +29,13 @@ HANDSHAKE_TAGS = {"SH", "CCS", "EE", "Cert", "CV", "Fin", "NST"}
 
 def load(run, name):
     path = f"{run}/{name}/analysis.json"
-    if not os.path.exists(path):
-        subprocess.run([sys.executable, f"{CODE}/analyze.py", run, name], capture_output=True)
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        if all("server_psk_selected" in stream and "h2_startup" in stream
+               and (not stream["h2_startup"] or "before" in stream["h2_startup"]) for stream in data):
+            return data
+    subprocess.run([sys.executable, f"{CODE}/analyze.py", run, name], stdout=subprocess.DEVNULL, check=True)
     with open(path) as f:
         return json.load(f)
 
@@ -116,26 +121,9 @@ def same_shape(a, b):
     return True
 
 
-def resumed(stream):
-    """Whether the server resumed: a ticket was offered and its flight
-    carries no certificate. A ticket the server refused leaves a full
-    handshake, which is compared as one."""
-    if not stream["ch"] or not stream["ch"]["psk_identities"]:
-        return False
-    flight = []
-    for r in stream["records"]:
-        if r["dir"] == "c>s" and "Fin" in r.get("hs", []):
-            break
-        if r["dir"] == "s>c":
-            flight += tag(r).split("+")
-    if "SH" not in flight:
-        return True  # not decrypted: as offered
-    return "Cert" not in flight
-
-
 def split(streams):
-    full = [s for s in streams if s["ch"] and not resumed(s)]
-    res = [s for s in streams if s["ch"] and resumed(s)]
+    full = [s for s in streams if s["ch"] and s["server_psk_selected"] is False]
+    res = [s for s in streams if s["ch"] and s["server_psk_selected"] is True]
     return full, res
 
 
@@ -177,9 +165,10 @@ def compare(ref_run, our_run, browser, target, ref_name=None):
     # Time from the ServerHello to the client's Finished of full handshakes,
     # over that of resumed ones: the browser verifying the certificate.
     def verify_ms(streams):
-        timed = [s for s in streams if s["ch"] and "client_fin" in s.get("timing", {}) and "sh" in s["timing"]]
-        full = [s["timing"]["client_fin"] - s["timing"]["sh"] for s in timed if not resumed(s)]
-        res = sorted(s["timing"]["client_fin"] - s["timing"]["sh"] for s in timed if resumed(s))
+        timed = [s for s in streams if "client_fin" in s.get("timing", {}) and "sh" in s["timing"]]
+        full_streams, resumed_streams = split(timed)
+        full = [s["timing"]["client_fin"] - s["timing"]["sh"] for s in full_streams]
+        res = sorted(s["timing"]["client_fin"] - s["timing"]["sh"] for s in resumed_streams)
         if not full or not res:
             return None
         base = res[len(res) // 2]
@@ -209,10 +198,74 @@ def compare(ref_run, our_run, browser, target, ref_name=None):
 
 
 PAIRS = (("chrome", "chrome"), ("edge", "edge"), ("firefox", "firefox156"), ("firefox", "firefox160"))
+XHTTP_PAIRS = (("chrome", "chrome"), ("firefox", "firefox160"))
+
+
+def compare_h2(ref, ours, off=False):
+    """Compare each accepted handshake class to the observed reference variants."""
+    def startup(stream):
+        h2 = stream["h2_startup"]
+        if not h2:
+            return None
+        return h2 if off else {key: h2[key] for key in ("lengths", "controls")}
+
+    checks = []
+    if off:
+        offered = any((stream["ch"] or {}).get("psk_identities") for stream in (*ref, *ours))
+        checks.append(("PSK offer", not offered, "browser-off ClientHello offered PSK"))
+    for label, reference, candidate in zip(("full", "resumed"), split(ref), split(ours)):
+        expected = [startup(s) for s in reference if s["h2_startup"]]
+        observed = [startup(s) for s in candidate if s["h2_startup"]]
+        if off and label == "resumed" and (reference or candidate):
+            checks.append(("H2 resumed", False, "unexpected resumption in browser-off capture"))
+            continue
+        if label == "resumed" and not reference and not candidate:
+            continue
+        if not expected or not observed:
+            checks.append((f"H2 {label}", False, f"complete H2 startups: ref {len(expected)}, ours {len(observed)}"))
+            continue
+        unexpected = [s for s in observed if s not in expected]
+        checks.append((f"H2 {label}", not unexpected, f"ref {expected}, unexpected {unexpected}"))
+    return checks
+
+
+def compare_xhttp(ref_run, our_run, off=False):
+    pairs = (("off", "xhttp-off"),) if off else XHTTP_PAIRS
+    targets = set()
+    for run, prefixes in ((ref_run, [f"{browser}-" for _, browser in pairs]),
+                          (our_run, [f"xhttp-{fp}-" for fp, _ in pairs])):
+        for name in os.listdir(run):
+            for prefix in prefixes:
+                if name.startswith(prefix):
+                    targets.add(name.removeprefix(prefix))
+    if not targets:
+        print("DIFF no XHTTP captures")
+        return 1
+    failed = 0
+    for target in sorted(targets):
+        for fp, browser in pairs:
+            ref_name, our_name = f"{browser}-{target}", f"xhttp-{fp}-{target}"
+            reference = our_run if target == "stub" and not off else ref_run
+            print(f"== XHTTP {fp} via {target}, reference {browser}")
+            if not os.path.isdir(f"{reference}/{ref_name}") or not os.path.isdir(f"{our_run}/{our_name}"):
+                print(f"  DIFF need {ref_name} and {our_name}")
+                failed += 1
+                continue
+            expected = load(reference, ref_name)
+            fetch_ref = f"fetch-{ref_name}"
+            if fp == "chrome" and os.path.isdir(f"{reference}/{fetch_ref}"):
+                expected += load(reference, fetch_ref)
+            for name, ok, detail in compare_h2(expected, load(our_run, our_name), off):
+                failed += not ok
+                print(f"  {'ok  ' if ok else 'DIFF'} {name:14s}" + (f" {detail}" if not ok else ""))
+    print(f"{failed} XHTTP differences")
+    return int(failed > 0)
 
 
 def main():
     """Exits 1 when anything differs, or a reference has no capture of ours."""
+    if len(sys.argv) == 4 and sys.argv[1] in ("--xhttp", "--xhttp-off"):
+        sys.exit(compare_xhttp(*sys.argv[2:], off=sys.argv[1] == "--xhttp-off"))
     ref_run, our_run = sys.argv[1], sys.argv[2]
     failed = 0
     targets = set()
@@ -221,10 +274,12 @@ def main():
             for prefix in prefixes:
                 if d.startswith(prefix + "-"):
                     targets.add(d[len(prefix) + 1:])
+    checked = 0
     for target in sorted(targets):
         for browser, ref_name in PAIRS:
             if not os.path.isdir(f"{ref_run}/{ref_name}-{target}"):
                 continue
+            checked += 1
             print(f"== {browser} via {target}, reference {ref_name}")
             if not os.path.isdir(f"{our_run}/xray-{browser}-{target}"):
                 failed += 1
@@ -233,6 +288,9 @@ def main():
             for name, ok, detail in compare(ref_run, our_run, browser, target, ref_name):
                 failed += not ok
                 print(f"  {'ok  ' if ok else 'DIFF'} {name:14s}" + (f" {detail}" if detail and not ok else ""))
+    if not checked:
+        print("DIFF no browser reference captures")
+        failed += 1
     print(f"{failed} differences")
     sys.exit(1 if failed else 0)
 
