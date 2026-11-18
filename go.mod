@@ -71,4 +71,4 @@ tool (
 	google.golang.org/protobuf/cmd/protoc-gen-go
 )
 
-replace github.com/refraction-networking/utls => github.com/Medium1992/utls v0.0.0-20261114100338-6953ee5a2742
+replace github.com/refraction-networking/utls => github.com/Medium1992/utls v1.8.3-xray-a13c59f-ff156.0.20261116230501-18007aed8773

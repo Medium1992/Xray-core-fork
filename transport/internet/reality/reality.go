@@ -139,6 +139,15 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 	return nil
 }
 
+// UsesBrowserProfile reports whether the client requests browser behavior.
+func (c *Config) UsesBrowserProfile() bool {
+	if c == nil || c.Browser != "auto" {
+		return false
+	}
+	fingerprint := tls.GetFingerprint(c.Fingerprint)
+	return fingerprint != nil && resumesSessions(*fingerprint)
+}
+
 func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
@@ -160,9 +169,47 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		c.Close()
 		return nil, errors.New("REALITY: failed to get fingerprint")
 	}
-	uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
+	browser := config.Browser == "auto" && resumesSessions(*fingerprint)
+	var ticketsKey string
+	var cache *connTickets
+	if browser {
+		if delay := verifyDelay(*fingerprint, ticketKey(config, dest, utlsConfig.ServerName)); delay != nil {
+			utlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
+				err := uConn.VerifyPeerCertificate(rawCerts, chains)
+				if err == nil && uConn.Verified {
+					time.Sleep(delay())
+				}
+				return err
+			}
+		}
+		ticketsKey = ticketKey(config, dest, utlsConfig.ServerName)
+		cache = &connTickets{key: ticketsKey, conn: uConn, session: tickets.offer(ticketsKey)}
+		utlsConfig.SessionTicketsDisabled = false
+		utlsConfig.ClientSessionCache = cache
+		utlsConfig.OmitEmptyPsk = true
+		utlsConfig.AlwaysIncludePSK = true
+		utlsConfig.InsecureSkipTimeVerify = true // REALITY's certificate has no validity
+	}
+	// uTLS takes the ticket from the cache when it builds the ClientHello.
+	offered := cache != nil && cache.session != nil
+	var spec *utls.ClientHelloSpec
+	if offered {
+		spec = resumptionSpec(*fingerprint, cache.session)
+	}
+	if spec != nil {
+		uConn.UConn = utls.UClient(c, utlsConfig, utls.HelloCustom)
+		if err := uConn.ApplyPreset(spec); err != nil {
+			c.Close()
+			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
+		}
+	} else {
+		uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
+	}
 	{
-		uConn.BuildHandshakeState()
+		if err := uConn.BuildHandshakeState(); err != nil {
+			c.Close()
+			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
+		}
 		if err := tls.FixRandomizedHello(uConn.UConn); err != nil {
 			c.Close()
 			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
@@ -174,6 +221,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		hello.SessionId[1] = core.Version_y
 		hello.SessionId[2] = core.Version_z
 		hello.SessionId[3] = 0 // reserved
+		if browser {
+			hello.SessionId[3] = realityTicketsFlag
+		}
 		binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 		copy(hello.SessionId[8:], config.ShortId)
 		if config.Show {
@@ -204,12 +254,40 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		if config.Show {
 			fmt.Printf("REALITY localAddr: %v\tuConn.AuthKey[:16]: %v\tAEAD: %T\n", localAddr, uConn.AuthKey[:16], aead)
 		}
-		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
+		aad := hello.Raw
+		psk := offeredPSK(uConn.UConn)
+		if psk != nil {
+			aad = pskAAD(hello.Raw, psk.Binders)
+		}
+		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], aad)
 		copy(hello.Raw[39:], hello.SessionId)
+		if psk != nil {
+			// The binders cover the session id written above.
+			if err := psk.PatchBuiltHello(hello); err != nil && err != io.EOF {
+				c.Close()
+				return nil, errors.New("REALITY: failed to bind the ticket").Base(err)
+			}
+		}
 	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
+		if offered {
+			tickets.fail(ticketsKey)
+		}
 		uConn.Close()
 		return nil, err
+	}
+	if browser {
+		if uConn.ConnectionState().DidResume {
+			// Only the server that issued the ticket completes this
+			// handshake, and only verified servers' tickets are kept.
+			uConn.Verified = true
+		} else if !uConn.Verified {
+			if offered {
+				tickets.fail(ticketsKey)
+			} else {
+				tickets.clear(ticketsKey)
+			}
+		}
 	}
 	if config.Show {
 		fmt.Printf("REALITY localAddr: %v\tuConn.Verified: %v\n", localAddr, uConn.Verified)
