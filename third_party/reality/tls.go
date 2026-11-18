@@ -206,6 +206,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	waitGroup.Add(2)
 
 	go func() {
+		authenticated := false
 		for {
 			mutex.Lock()
 			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
@@ -258,7 +259,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				copy(ciphertext, hs.clientHello.sessionId)
 				copy(hs.clientHello.sessionId, plainText) // hs.clientHello.sessionId points to hs.clientHello.raw[39:]
 				_, err = aead.Open(plainText[:0], hs.clientHello.random[20:], ciphertext, hs.clientHello.original)
-				if err != nil && len(hs.clientHello.pskBinders) != 0 {
+				if err != nil && config.BrowserMode && len(hs.clientHello.pskBinders) != 0 {
 					// A client that offers a ticket seals its session id over the ClientHello without the binders, which cover the session id.
 					_, err = aead.Open(plainText[:0], hs.clientHello.random[20:], ciphertext, pskAAD(hs.clientHello.original, hs.clientHello.pskBinders))
 				}
@@ -276,21 +277,27 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
 					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientShortId: %v\n", remoteAddr, hs.c.ClientShortId)
 				}
+				now := time.Now()
 				if (config.MinClientVer == nil || Value(hs.c.ClientVer[:]...) >= Value(config.MinClientVer...)) &&
 					(config.MaxClientVer == nil || Value(hs.c.ClientVer[:]...) <= Value(config.MaxClientVer...)) &&
-					(config.MaxTimeDiff == 0 || time.Since(hs.c.ClientTime).Abs() <= config.MaxTimeDiff) &&
-					(config.ShortIds[hs.c.ClientShortId]) {
-					hs.c.conn = conn
+					(config.MaxTimeDiff == 0 || now.Sub(hs.c.ClientTime).Abs() <= config.MaxTimeDiff) &&
+					config.ShortIds[hs.c.ClientShortId] {
+					authenticated = true
 				}
 				break
 			}
-			if config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\ths.c.conn == conn: %v\n", remoteAddr, hs.c.conn == conn)
-			}
 			break
 		}
+		var validBinder, invalidBinder bool
 		if config.BrowserMode && hs.clientHello != nil && hs.c.vers == VersionTLS13 && config.ServerNames[hs.clientHello.serverName] {
-			hs.refusal = hs.ticketRefusal()
+			hs.refusal, validBinder, invalidBinder = hs.inspectTicketHello()
+		}
+		if authenticated && !invalidBinder && ticketHellos.acceptClientHello(&hs, time.Now(), validBinder) {
+			hs.c.conn = conn
+			hs.ticketHelloAccepted = hs.c.realityTickets && validBinder
+		}
+		if config.Show {
+			fmt.Printf("REALITY remoteAddr: %v\ths.c.conn == conn: %v\n", remoteAddr, hs.c.conn == conn)
 		}
 		mutex.Unlock()
 		if hs.refusal != nil {
@@ -300,19 +307,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				fmt.Printf("REALITY remoteAddr: %v\trefused a ticket with a wrong binder: % x after %v\n", remoteAddr, hs.refusal.BadBinder, hs.refusal.BadBinderDelay)
 			}
 			target.Close()
-			if hs.refusal.BadBinderDelay > 0 {
-				conn.SetReadDeadline(time.Now().Add(hs.refusal.BadBinderDelay))
-				io.Copy(io.Discard, underlying) // until then, or until the client goes
-				conn.SetReadDeadline(time.Time{})
-			}
-			// Close as a server that sends an alert does: FIN after it,
-			// then whatever the client still sends, so that no reset
-			// takes the alert with it.
-			conn.Write(hs.refusal.BadBinder)
-			underlying.CloseWrite()
-			conn.SetReadDeadline(time.Now().Add(time.Second))
-			io.Copy(io.Discard, underlying)
-			conn.Close()
+			closeAfterRefusal(conn, underlying, hs.refusal)
 			waitGroup.Done()
 			return
 		}
@@ -454,18 +449,24 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 				key, alpn := recordsKey(config, hs.clientHello)
 				if val, ok := GlobalPostHandshakeRecordsLens.Load(key); ok {
 					if postHandshakeRecordsLens, ok := val.([]int); ok {
-						if hs.c.realityTickets && config.AppRecords && alpn == 2 {
-							hs.c.h2Startup = detectH2Startup(config, key, hs.clientHello.serverName).
-								records(hs.usingPSK, hasFirefoxH2Fingerprint(hs.clientHello))
+						var h2Profiles *h2StartupProfiles
+						firefox := hasFirefoxH2Fingerprint(hs.clientHello)
+						if hs.ticketShape != nil && config.AppRecords && alpn == 2 {
+							profiles := detectH2Startup(config, key, hs.clientHello.serverName)
+							h2Profiles = &profiles
+							hs.c.h2Startup = profiles.records(hs.usingPSK, firefox, false)
 						}
 						lens, tickets := hs.postHandshakeRecords(postHandshakeRecordsLens)
 						for i, length := range lens {
-							if len(hs.c.h2Startup) != 0 && tickets[i] == 0 {
-								continue
-							}
 							if tickets[i] > 0 {
 								if msgs := hs.c.ticketMsgs(hs.ticketShape, length, tickets[i]); msgs != nil {
-									hs.c.writeTicketRecord(msgs, length)
+									if err := hs.c.writeTicketRecord(msgs, length); err != nil {
+										mutex.Unlock()
+										conn.Close()
+										target.Close()
+										waitGroup.Done()
+										return
+									}
 									if config.Show {
 										fmt.Printf("REALITY remoteAddr: %v\tlen(NewSessionTicket record): %v\n", remoteAddr, length)
 									}
@@ -484,6 +485,18 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 							hs.c.write(postHandshakeRecord)
 							if config.Show {
 								fmt.Printf("REALITY remoteAddr: %v\tlen(postHandshakeRecord): %v\n", remoteAddr, len(postHandshakeRecord))
+							}
+						}
+						if h2Profiles != nil && len(hs.c.h2Startup) != 0 && !hs.usingPSK && !firefox {
+							// The target starts HTTP/2 once its tickets are out,
+							// with whatever the client sent by then. Only a full
+							// Chromium handshake chooses by it.
+							pipelined := hs.c.inputPending()
+							if records := h2Profiles.records(hs.usingPSK, firefox, pipelined); len(records) != 0 {
+								hs.c.h2Startup = records
+							}
+							if config.Show {
+								fmt.Printf("REALITY remoteAddr: %v\tclient data waiting: %v\th2 startup: %v\n", remoteAddr, pipelined, hs.c.h2Startup)
 							}
 						}
 						break
@@ -554,6 +567,52 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		c.handshakeFn = c.serverHandshake
 		return c
 	*/
+}
+
+func closeAfterRefusal(conn net.Conn, underlying CloseWriteConn, shape *TicketShape) {
+	defer conn.Close()
+	if shape.BadBinderDelay > 0 {
+		deadline := time.Now().Add(shape.BadBinderDelay)
+		if err := underlying.SetReadDeadline(deadline); err != nil {
+			return
+		}
+		if _, err := io.Copy(io.Discard, underlying); err == nil {
+			// A peer can send FIN and still read the pending response.
+			time.Sleep(time.Until(deadline))
+		}
+	}
+	if shape.badBinderClose == resetRefusal && setAbortiveClose(underlying) {
+		return
+	}
+	if len(shape.BadBinder) > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+			return
+		}
+		if _, err := conn.Write(shape.BadBinder); err != nil {
+			return
+		}
+	}
+	// Preserve the FIN and any alert by draining the peer's remaining data.
+	underlying.CloseWrite()
+	if err := underlying.SetReadDeadline(time.Now().Add(time.Second)); err == nil {
+		io.Copy(io.Discard, underlying)
+	}
+}
+
+func setAbortiveClose(conn net.Conn) bool {
+	for range 8 {
+		switch c := conn.(type) {
+		case interface{ SetLinger(int) error }:
+			return c.SetLinger(0) == nil
+		case interface{ NetConn() net.Conn }:
+			conn = c.NetConn()
+		case interface{ Raw() net.Conn }:
+			conn = c.Raw()
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // [REALITY] SECTION END

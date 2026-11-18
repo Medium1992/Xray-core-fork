@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -78,36 +80,63 @@ type TicketShape struct {
 	ResRecords []int
 	// ResTickets is the number of tickets after a resumed handshake.
 	ResTickets int
-	// BadBinder is what the target sends back to one of its tickets
-	// offered with a wrong binder, alerts such as decrypt_error, after
-	// BadBinderDelay (CloudFront waits about 25 s; nothing at all when
-	// BadBinder is empty and the delay set). RefusesBadBinder is false when
-	// the target does not refuse so, or until its probe, which runs after
-	// the rest, ends.
+	// BadBinder contains any TLS alerts from the refusal. A refusal can
+	// also close the connection without TLS records.
 	RefusesBadBinder bool
 	BadBinder        []byte
 	BadBinderDelay   time.Duration
+	badBinderClose   refusalKind
+	// refusalAt is when the refusal was measured. A refresh carries it
+	// only for ticketShapeMaxAge, as long as a profile lives without a
+	// successful measurement.
+	refusalAt time.Time
 
+	noTickets        bool
 	probed           time.Time
+	failedSince      time.Time
 	badBinderSession *utls.ClientSessionState
 }
 
 // storeTicketShape stores shape for key, then probes how the target refuses
 // a wrong binder, which may take long, and stores the shape again with it.
-func storeTicketShape(config *Config, key, sni string, alpn int, shape *TicketShape) {
+// Until then the refusal of previous, the shape shape replaces, stands.
+func storeTicketShape(config *Config, key, sni string, alpn int, shape, previous *TicketShape) {
 	shape.probed = time.Now()
-	GlobalTicketShapes.Store(key, shape)
+	published := shape
+	if previous != nil && previous.RefusesBadBinder && shape.Resumes &&
+		shape.probed.Sub(previous.refusalAt) < ticketShapeMaxAge && !previous.expired(shape.probed) {
+		carried := *shape
+		carried.copyRefusal(previous)
+		published = &carried
+	}
+	GlobalTicketShapes.Store(key, published)
 	if !shape.Resumes || shape.badBinderSession == nil {
 		return
 	}
-	answer, delay, ok := probeBadBinder(config, sni, alpn, shape.badBinderSession)
-	if !ok {
+	reply := confirmBinderRefusal(func() binderRefusal {
+		return probeBadBinder(config, sni, alpn, shape.badBinderSession)
+	})
+	if reply.kind == noRefusal && published == shape {
 		return
 	}
-	refusing := *shape
-	refusing.RefusesBadBinder, refusing.BadBinder, refusing.BadBinderDelay = true, answer, delay
-	refusing.badBinderSession = nil
-	GlobalTicketShapes.CompareAndSwap(key, shape, &refusing)
+	final := *shape
+	if reply.inconclusive {
+		// No new evidence about the refusal: the carried one stands.
+		final = *published
+	}
+	final.badBinderSession = nil
+	if reply.kind != noRefusal {
+		final.RefusesBadBinder = true
+		final.BadBinder, final.BadBinderDelay, final.badBinderClose = reply.alerts, reply.delay, reply.kind
+		final.refusalAt = time.Now()
+	}
+	GlobalTicketShapes.CompareAndSwap(key, published, &final)
+}
+
+func (shape *TicketShape) copyRefusal(from *TicketShape) {
+	shape.RefusesBadBinder = from.RefusesBadBinder
+	shape.BadBinder, shape.BadBinderDelay, shape.badBinderClose = from.BadBinder, from.BadBinderDelay, from.badBinderClose
+	shape.refusalAt = from.refusalAt
 }
 
 // ticketRecordOverhead is what a TLS 1.3 record holding a NewSessionTicket
@@ -130,23 +159,28 @@ func DetectTicketShape(config *Config, key, sni string, alpn int) {
 		return
 	}
 	go func() {
-		shape, _ := probeTicketShape(config, sni, alpn)
+		shape, err := probeTicketShape(config, sni, alpn)
 		if shape == nil {
-			shape = &TicketShape{}
+			shape = &TicketShape{noTickets: errors.Is(err, errNoTargetTickets)}
 		}
-		storeTicketShape(config, key, sni, alpn, shape)
+		storeTicketShape(config, key, sni, alpn, shape, nil)
 	}()
 }
 
 // ticketShapeRefresh is how often the target is probed again: a target
 // that restarts may get a new ticket key, and its tickets a new prefix.
-const ticketShapeRefresh = time.Hour
+const (
+	ticketShapeRefresh = time.Hour
+	ticketShapeMaxAge  = 3 * ticketShapeRefresh
+)
+
+var errNoTargetTickets = errors.New("reality: the target issues no tickets")
 
 var refreshingTicketShapes sync.Map
 
 // RefreshTicketShape probes the target again for key once the shape is
-// older than ticketShapeRefresh. The old shape stays in use until then,
-// and when the probe fails.
+// older than ticketShapeRefresh. Start aging the profile at the first failed
+// refresh so an idle inbound can use its last successful measurement.
 func RefreshTicketShape(config *Config, key, sni string, alpn int) {
 	val, _ := GlobalTicketShapes.Load(key)
 	shape, ok := val.(*TicketShape)
@@ -156,29 +190,65 @@ func RefreshTicketShape(config *Config, key, sni string, alpn int) {
 	if _, busy := refreshingTicketShapes.LoadOrStore(key, struct{}{}); busy {
 		return
 	}
+	// The preceding refresh may have finished since the first load.
+	if current, _ := GlobalTicketShapes.Load(key); current != shape {
+		refreshingTicketShapes.Delete(key)
+		return
+	}
 	go func() {
 		defer refreshingTicketShapes.Delete(key)
-		fresh, _ := probeTicketShape(config, sni, alpn)
-		if fresh == nil {
-			again := *shape
-			fresh = &again
+		fresh, err := probeTicketShape(config, sni, alpn)
+		if err == nil {
+			storeTicketShape(config, key, sni, alpn, fresh, shape)
+			return
 		}
-		storeTicketShape(config, key, sni, alpn, fresh)
+		now := time.Now()
+		noTickets := errors.Is(err, errNoTargetTickets)
+		// A probe reads for ticketProbeWait only, and a destination may send
+		// its tickets later: one that issued tickets has not shown it stopped,
+		// so that refresh failed and the profile ages until it expires.
+		if (noTickets && !shape.Issues) || shape.expired(now) {
+			// An issuer that expired has only shown inconclusive samples:
+			// its profile becomes unknown, and the next refresh decides.
+			GlobalTicketShapes.Store(key, &TicketShape{probed: now, noTickets: noTickets && !shape.Issues})
+			return
+		}
+		again := *shape
+		again.probed = now
+		if again.failedSince.IsZero() {
+			again.failedSince = now
+		}
+		GlobalTicketShapes.Store(key, &again)
 	}()
 }
 
 // LoadTicketShape returns the shape probed for key, or nil while the probe
-// runs or when the target issues no tickets.
+// runs, when the target issues no tickets, or when the profile expired.
 func LoadTicketShape(key string) *TicketShape {
+	shape := loadTicketProfile(key)
+	if shape == nil || !shape.Issues {
+		return nil
+	}
+	return shape
+}
+
+// loadTicketProfile also returns successful measurements of targets that
+// do not issue tickets, so HTTP/2 shaping can distinguish them from probes
+// that have not completed.
+func loadTicketProfile(key string) *TicketShape {
 	val, ok := GlobalTicketShapes.Load(key)
 	if !ok {
 		return nil
 	}
 	shape, ok := val.(*TicketShape)
-	if !ok || !shape.Issues {
+	if !ok || (!shape.Issues && !shape.noTickets) || shape.expired(time.Now()) {
 		return nil
 	}
 	return shape
+}
+
+func (shape *TicketShape) expired(now time.Time) bool {
+	return !shape.failedSince.IsZero() && now.Sub(shape.failedSince) >= ticketShapeMaxAge
 }
 
 // ticketRecorder is a ClientSessionCache that keeps every ticket put in it
@@ -187,6 +257,7 @@ type ticketRecorder struct {
 	sync.Mutex
 	sessions []*utls.ClientSessionState
 	replay   *utls.ClientSessionState
+	overflow bool
 }
 
 func (r *ticketRecorder) Get(string) (*utls.ClientSessionState, bool) {
@@ -201,23 +272,36 @@ func (r *ticketRecorder) Put(_ string, cs *utls.ClientSessionState) {
 	}
 	r.Lock()
 	defer r.Unlock()
-	r.sessions = append(r.sessions, cs)
+	if len(r.sessions) < maxProbeTickets {
+		r.sessions = append(r.sessions, cs)
+	} else {
+		r.overflow = true
+	}
 }
 
-func (r *ticketRecorder) take() []*utls.ClientSessionState {
+func (r *ticketRecorder) take() ([]*utls.ClientSessionState, bool) {
 	r.Lock()
 	defer r.Unlock()
 	sessions := r.sessions
 	r.sessions = nil
-	return sessions
+	return sessions, r.overflow
 }
 
 // probeCaptureConn records what the target sends.
+const (
+	maxProbeBytes   = 512 << 10
+	maxProbeTickets = 32
+)
+
+var errProbeLimit = errors.New("reality: destination probe exceeded its byte limit")
+
 type probeCaptureConn struct {
 	net.Conn
 	mu        sync.Mutex
 	in        []byte
 	firstByte time.Time
+	readErr   error
+	readEnd   time.Time
 }
 
 func (c *probeCaptureConn) Read(b []byte) (int, error) {
@@ -225,6 +309,14 @@ func (c *probeCaptureConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
 	if n > 0 && c.firstByte.IsZero() {
 		c.firstByte = time.Now()
+	}
+	if n > maxProbeBytes-len(c.in) {
+		err = errProbeLimit
+		n = maxProbeBytes - len(c.in)
+	}
+	if err != nil {
+		c.readErr = err
+		c.readEnd = time.Now()
 	}
 	c.in = append(c.in, b[:n]...)
 	c.mu.Unlock()
@@ -303,7 +395,7 @@ func probeOnce(config *Config, sni string, alpn int, replay *utls.ClientSessionS
 	}
 	uConn, err := probeClient(capture, &utls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: sni == "",
 		NextProtos:         nextProtos,
 		ClientSessionCache: recorder,
 	}, alpn, replay != nil)
@@ -314,17 +406,31 @@ func probeOnce(config *Config, sni string, alpn int, replay *utls.ClientSessionS
 		return nil, err
 	}
 	// Tickets are processed as they are read.
-	target.SetReadDeadline(time.Now().Add(ticketProbeWait))
-	io.Copy(io.Discard, uConn)
+	if err := target.SetReadDeadline(time.Now().Add(ticketProbeWait)); err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(io.Discard, uConn); err != nil {
+		var readErr net.Error
+		if !errors.As(err, &readErr) || !readErr.Timeout() {
+			return nil, err
+		}
+	}
+	if errors.Is(capture.readErr, errProbeLimit) {
+		return nil, errProbeLimit
+	}
 
 	records := splitRecords(capture.received())
 	if len(records) < 2 || records[0].typ != byte(recordTypeHandshake) {
 		return nil, errors.New("reality: unexpected server flight")
 	}
+	sessions, overflow := recorder.take()
+	if overflow {
+		return nil, errProbeLimit
+	}
 	h := &probeHandshake{
 		hello:    records[0],
 		resumed:  uConn.ConnectionState().DidResume,
-		sessions: recorder.take(),
+		sessions: sessions,
 	}
 	for _, r := range records[1:] {
 		if r.typ == byte(recordTypeApplicationData) {
@@ -342,7 +448,7 @@ func probeTicketShape(config *Config, sni string, alpn int) (*TicketShape, error
 		return nil, err
 	}
 	if len(full.sessions) == 0 {
-		return nil, errors.New("reality: the target issues no tickets")
+		return nil, errNoTargetTickets
 	}
 	shape := &TicketShape{
 		Tickets:     len(full.sessions),
@@ -478,6 +584,9 @@ func ticketLifetime(state *utls.SessionState) (uint32, bool) {
 }
 
 func commonPrefix(tickets [][]byte) []byte {
+	if len(tickets) < 2 {
+		return nil
+	}
 	prefix := tickets[0]
 	for _, ticket := range tickets[1:] {
 		n := 0
@@ -486,8 +595,10 @@ func commonPrefix(tickets [][]byte) []byte {
 		}
 		prefix = prefix[:n]
 	}
-	if len(tickets) < 2 {
-		prefix = nil // one ticket shows no prefix
+	// With two random tickets a single matching byte is unsurprising.
+	// Retain only prefixes long enough to indicate a stable key identifier.
+	if len(prefix) < 4 {
+		return nil
 	}
 	return bytes.Clone(prefix)
 }
@@ -543,31 +654,129 @@ func serverHelloExtensionTypes(msg []byte) ([]uint16, error) {
 	return types, err
 }
 
-// binderSpoiler flips the last byte of the first record it writes: the end
-// of the binders of a ClientHello that offers a ticket.
+// binderSpoiler flips the last byte of the first record it writes when that
+// record is a ClientHello offering a ticket: the end of its binders. Without
+// pre_shared_key the byte belongs to another extension, and the answer would
+// say nothing about how the destination refuses a wrong binder, so sentAt
+// stays zero.
 type binderSpoiler struct {
 	net.Conn
-	done bool
+	done   bool
+	sentAt time.Time
 }
 
 func (c *binderSpoiler) Write(b []byte) (int, error) {
 	if !c.done && len(b) > 0 && b[0] == byte(recordTypeHandshake) {
 		c.done = true
+		if !offersTicket(b) {
+			return c.Conn.Write(b)
+		}
 		b = bytes.Clone(b)
 		b[len(b)-1] ^= 1
+		n, err := c.Conn.Write(b)
+		if n == len(b) && err == nil {
+			sentAt := time.Now()
+			if err := c.SetReadDeadline(sentAt.Add(badBinderWait)); err != nil {
+				return n, err
+			}
+			c.sentAt = sentAt
+		}
+		return n, err
 	}
 	return c.Conn.Write(b)
+}
+
+// offersTicket reports whether record is a single TLS record holding a
+// ClientHello that ends with pre_shared_key.
+func offersTicket(record []byte) bool {
+	if len(record) < recordHeaderLen || recordHeaderLen+int(binary.BigEndian.Uint16(record[3:5])) != len(record) {
+		return false
+	}
+	var hello clientHelloMsg
+	return hello.unmarshal(record[recordHeaderLen:]) && len(hello.pskIdentities) != 0
 }
 
 // badBinderWait is how long the probe of a wrong binder waits for the
 // target's answer.
 const badBinderWait = 40 * time.Second
 
-// probeBadBinder offers the target its own ticket with a wrong binder and
-// returns what it sends back and after how long, if that is alerts or
-// nothing at all, as a server that issued the ticket answers; ok is false
-// when the target goes on with the handshake instead.
-func probeBadBinder(config *Config, sni string, alpn int, session *utls.ClientSessionState) (answer []byte, delay time.Duration, ok bool) {
+type refusalKind uint8
+
+const (
+	noRefusal refusalKind = iota
+	alertRefusal
+	finRefusal
+	resetRefusal
+	silentRefusal
+)
+
+type binderRefusal struct {
+	kind   refusalKind
+	alerts []byte
+	delay  time.Duration
+	// inconclusive marks a noRefusal that measured nothing: the probe did
+	// not send a binder, or its answer was neither a refusal nor silence.
+	inconclusive bool
+}
+
+var inconclusiveRefusal = binderRefusal{inconclusive: true}
+
+func confirmBinderRefusal(probe func() binderRefusal) binderRefusal {
+	reply := probe()
+	if reply.kind == silentRefusal && probe().kind != silentRefusal {
+		return inconclusiveRefusal
+	}
+	return reply
+}
+
+func connectionWasReset(err error) bool {
+	// net.OpError wraps the Winsock errno on Windows.
+	const wsaConnectionReset = syscall.Errno(10054)
+	return errors.Is(err, syscall.ECONNRESET) ||
+		(runtime.GOOS == "windows" && errors.Is(err, wsaConnectionReset))
+}
+
+func classifyBinderRefusal(capture *probeCaptureConn, start time.Time) binderRefusal {
+	if errors.Is(capture.readErr, errProbeLimit) {
+		return inconclusiveRefusal
+	}
+	answer := capture.received()
+	if len(answer) == 0 {
+		delay := capture.readEnd.Sub(start)
+		switch err := capture.readErr; {
+		case errors.Is(err, io.EOF):
+			return binderRefusal{kind: finRefusal, delay: delay}
+		case connectionWasReset(err):
+			return binderRefusal{kind: resetRefusal, delay: delay}
+		}
+		var timeout net.Error
+		if errors.As(capture.readErr, &timeout) && timeout.Timeout() && capture.readEnd.Sub(start) >= badBinderWait {
+			return binderRefusal{kind: silentRefusal, delay: badBinderWait}
+		}
+		return inconclusiveRefusal
+	}
+	n := 0
+	for _, r := range splitRecords(answer) {
+		if r.typ != byte(recordTypeAlert) {
+			return binderRefusal{}
+		}
+		n += r.len()
+	}
+	if n != len(answer) {
+		return inconclusiveRefusal // the read ended inside an alert
+	}
+	return binderRefusal{kind: alertRefusal, alerts: answer, delay: refusalDelay(capture.firstByte.Sub(start))}
+}
+
+func refusalDelay(delay time.Duration) time.Duration {
+	if delay < time.Second {
+		return 0 // treat round-trip latency as an immediate refusal
+	}
+	return delay
+}
+
+// probeBadBinder measures the target's response after a complete write.
+func probeBadBinder(config *Config, sni string, alpn int, session *utls.ClientSessionState) binderRefusal {
 	dial := config.DialContext
 	if dial == nil {
 		dial = new(net.Dialer).DialContext
@@ -576,12 +785,15 @@ func probeBadBinder(config *Config, sni string, alpn int, session *utls.ClientSe
 	defer cancel()
 	target, err := dial(ctx, config.Type, config.Dest)
 	if err != nil {
-		return nil, 0, false
+		return inconclusiveRefusal
 	}
 	defer target.Close()
+	if err := target.SetDeadline(time.Now().Add(ticketProbeTimeout)); err != nil {
+		return inconclusiveRefusal
+	}
 	if config.Xver == 1 || config.Xver == 2 {
 		if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, target.LocalAddr(), target.RemoteAddr()).WriteTo(target); err != nil {
-			return nil, 0, false
+			return inconclusiveRefusal
 		}
 	}
 	capture := &probeCaptureConn{Conn: target}
@@ -592,32 +804,21 @@ func probeBadBinder(config *Config, sni string, alpn int, session *utls.ClientSe
 	case 2:
 		nextProtos = []string{"h2", "http/1.1"}
 	}
-	start := time.Now()
-	target.SetDeadline(start.Add(badBinderWait))
-	uConn := utls.UClient(&binderSpoiler{Conn: capture}, &utls.Config{
+	spoiler := &binderSpoiler{Conn: capture}
+	uConn := utls.UClient(spoiler, &utls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: sni == "",
 		NextProtos:         nextProtos,
 		ClientSessionCache: &ticketRecorder{replay: session},
 	}, utls.HelloGolang)
-	uConn.Handshake()
-	delay = capture.firstByte.Sub(start)
-	answer = capture.received()
-	if len(answer) == 0 {
-		return nil, badBinderWait, true
+	err = uConn.Handshake()
+	switch {
+	case spoiler.sentAt.IsZero():
+		return inconclusiveRefusal
+	case err == nil:
+		return binderRefusal{} // the destination went on: it does not refuse
 	}
-	records := splitRecords(answer)
-	n := 0
-	for _, r := range records {
-		if r.typ != byte(recordTypeAlert) {
-			return nil, 0, false
-		}
-		n += r.len()
-	}
-	if delay < time.Second {
-		delay = 0 // an answer right away, but for the round trip
-	}
-	return answer[:n], delay, n > 0
+	return classifyBinderRefusal(capture, spoiler.sentAt)
 }
 
 // probeClient returns the client of a probe: Chrome's ClientHello for the

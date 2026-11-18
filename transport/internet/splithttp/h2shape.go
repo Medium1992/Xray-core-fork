@@ -23,6 +23,7 @@ const (
 	frameHeaderLen  = 9
 	frameSettings   = 0x4
 	frameWindowUpd  = 0x8
+	settingTableSz  = 0x1
 	settingMaxConc  = 0x3
 	settingInitWin  = 0x4
 	settingMaxFrame = 0x5
@@ -80,6 +81,25 @@ type h2StartupConn interface {
 	WritePaddedAppRecord([]byte, int) (int, error)
 }
 
+func (c *shapeConn) NetConn() net.Conn {
+	return c.Conn
+}
+
+func (c *shapeConn) Close() error {
+	err := c.Conn.Close()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.finishStartup()
+	return err
+}
+
+func (c *shapeConn) finishStartup() {
+	c.state = 2
+	if c.timer != nil {
+		c.timer.Stop()
+	}
+}
+
 // recordOverhead is what a TLS 1.3 record adds to its content: the header,
 // the content type and the AEAD tag.
 const recordOverhead = 5 + 1 + 16
@@ -126,11 +146,28 @@ func (c *shapeConn) waitForStartup() {
 	}
 	c.timer = time.AfterFunc(wait, func() {
 		c.mu.Lock()
-		defer c.mu.Unlock()
+		failed := false
 		if c.state == 1 {
 			c.err = c.writeStartup(nil, true)
+			failed = c.err != nil
+		}
+		c.mu.Unlock()
+		if failed {
+			// No write follows that could return the error: abort, so the
+			// peer does not wait for the rest of a partial record.
+			abortTransport(c.Conn)
 		}
 	})
+}
+
+// abortTransport closes the socket under conn without writing to it: after
+// a failed write, a TLS close_notify would wait for the write deadline.
+func abortTransport(conn net.Conn) {
+	if inner, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		inner.NetConn().Close()
+		return
+	}
+	conn.Close()
 }
 
 // writeStartup collects the local control frames and emits each target record
@@ -169,10 +206,14 @@ func (c *shapeConn) writeStartup(b []byte, force bool) error {
 			frame := c.frames[kind]
 			if kind == reality.H2Settings {
 				frame = fitSettings(frame, room)
+				if frame == nil {
+					ready = false
+					break
+				}
 			}
 			payload = append(payload, frame...)
 		}
-		if len(payload)+recordOverhead > controlLength {
+		if !ready || len(payload)+recordOverhead > controlLength {
 			force = true
 			break
 		}
@@ -198,7 +239,7 @@ func (c *shapeConn) writeStartup(b []byte, force bool) error {
 			c.err = io.ErrShortWrite
 		}
 		if c.err != nil {
-			c.state = 2
+			c.finishStartup()
 			return c.err
 		}
 		c.profile = c.profile[1:]
@@ -209,10 +250,7 @@ func (c *shapeConn) writeStartup(b []byte, force bool) error {
 	if len(c.profile) > 0 {
 		c.startupGrant = 0
 	}
-	c.state = 2
-	if c.timer != nil {
-		c.timer.Stop()
-	}
+	c.finishStartup()
 	rest := c.startupRemainder(b)
 	if len(rest) == 0 {
 		return nil
@@ -312,21 +350,31 @@ func frameSize(b []byte) int {
 	return frameHeaderLen + (int(b[0])<<16 | int(b[1])<<8 | int(b[2]))
 }
 
-// settingsKept are the parameters kept first when SETTINGS has to shrink:
-// those that shape flow control, then the rest of what nginx sends.
-var settingsKept = []uint16{settingInitWin, settingMaxConc, settingMaxFrame}
-
-// fitSettings removes settings to fit the measured record.
-// The advertised stream window and concurrency limit stay in the frame.
+// fitSettings removes settings to fit the measured record, or returns nil
+// when the settings that must stay do not fit. The advertised stream window
+// and concurrency limit stay in the frame, and so does a header table
+// smaller than the default 4096 bytes: a peer that assumes the default
+// would encode headers the decoder rejects.
 func fitSettings(settings []byte, room int) []byte {
 	if len(settings) <= room {
 		return settings
 	}
 	selected := make(map[uint16]bool)
 	capacity := (room - frameHeaderLen) / 6
-	for _, id := range settingsKept {
-		if len(selected) < capacity || id == settingInitWin || id == settingMaxConc {
+	for p := frameHeaderLen; p+6 <= len(settings); p += 6 {
+		id := binary.BigEndian.Uint16(settings[p:])
+		if id == settingInitWin || id == settingMaxConc ||
+			(id == settingTableSz && binary.BigEndian.Uint32(settings[p+2:]) < 4096) {
 			selected[id] = true
+		}
+	}
+	if capacity < len(selected) || room < frameHeaderLen {
+		return nil
+	}
+	for p := frameHeaderLen; p+6 <= len(settings) && len(selected) < capacity; p += 6 {
+		if binary.BigEndian.Uint16(settings[p:]) == settingMaxFrame {
+			selected[settingMaxFrame] = true
+			break
 		}
 	}
 	for p := frameHeaderLen; p+6 <= len(settings); p += 6 {
@@ -348,37 +396,80 @@ func fitSettings(settings []byte, room int) []byte {
 
 // ackConn writes the acknowledgement of the server's SETTINGS in a record of
 // its own, as Chrome does; Go's client writes it with the WINDOW_UPDATE
-// that follows.
+// that follows. A frame header split across writes is held until it is
+// complete, so a fragmented acknowledgement still goes in one write.
 type ackConn struct {
 	net.Conn
+	mu          sync.Mutex
+	prefaceLeft int
+	held        []byte // the start of a frame header not yet written
+	payload     int
+	done        bool
+	// err ends the wrapper: after a failed write its frame boundaries no
+	// longer match what the peer received.
+	err error
 }
 
 func (c *ackConn) Write(b []byte) (int, error) {
-	at := -1
-	for p := 0; p+frameHeaderLen <= len(b); {
-		n := frameSize(b[p:])
-		if p+n > len(b) {
-			break
-		}
-		if b[p+3] == frameSettings && b[p+4]&0x1 != 0 {
-			at = p
-			break
-		}
-		p += n
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return 0, c.err
 	}
-	if at < 0 || len(b) == frameHeaderLen {
+	if c.done {
 		return c.Conn.Write(b)
 	}
+	data, held := b, len(c.held)
+	if held != 0 {
+		data = append(c.held, b...)
+		c.held = nil
+	}
+	p := min(c.prefaceLeft, len(data))
+	c.prefaceLeft -= p
+	at, end, partial := -1, 0, len(data)
+	for p < len(data) {
+		if c.payload > 0 {
+			n := min(c.payload, len(data)-p)
+			c.payload -= n
+			p += n
+			continue
+		}
+		if len(data)-p < frameHeaderLen {
+			partial = p
+			break
+		}
+		header := data[p : p+frameHeaderLen]
+		p += frameHeaderLen
+		c.payload = frameSize(header) - frameHeaderLen
+		if c.payload == 0 && header[3] == frameSettings && header[4]&0x1 != 0 &&
+			binary.BigEndian.Uint32(header[5:])&0x7fffffff == 0 {
+			c.done = true
+			at, end = p-frameHeaderLen, p
+			break
+		}
+	}
+	if partial < len(data) {
+		c.held = bytes.Clone(data[partial:])
+		data = data[:partial]
+	}
+	parts := [][]byte{data}
+	if at >= 0 {
+		parts = [][]byte{data[:at], data[at:end], data[end:]}
+	}
 	written := 0
-	for _, part := range [][]byte{b[:at], b[at : at+frameHeaderLen], b[at+frameHeaderLen:]} {
+	for _, part := range parts {
 		if len(part) == 0 {
 			continue
 		}
 		n, err := c.Conn.Write(part)
 		written += n
+		if err == nil && n != len(part) {
+			err = io.ErrShortWrite
+		}
 		if err != nil {
-			return written, err
+			c.err = err
+			return max(0, written-held), err
 		}
 	}
-	return written, nil
+	return len(b), nil
 }

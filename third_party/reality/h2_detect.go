@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -33,28 +32,73 @@ type H2StartupRecord struct {
 	ResponseBytes int // bytes from the first response HEADERS to the end of this record
 }
 
-var h2StartupRecords sync.Map
-
 type h2StartupProfiles struct {
 	full             []H2StartupRecord
 	resumed          []H2StartupRecord
 	resumedDelayed   []H2StartupRecord
-	firefoxFull      []H2StartupRecord
+	pipelinedFull    []H2StartupRecord // the greeting with the preface (and request) waiting
 	fullDelayedReply []H2StartupRecord
 	resumedWithReply []H2StartupRecord
 }
 
-func (p h2StartupProfiles) records(resumed, firefox bool) []H2StartupRecord {
+func (p h2StartupProfiles) withPrevious(previous h2StartupProfiles, missing *[6]time.Time, now time.Time) h2StartupProfiles {
+	current := [6]*[]H2StartupRecord{&p.full, &p.resumed, &p.resumedDelayed, &p.pipelinedFull, &p.fullDelayedReply, &p.resumedWithReply}
+	old := [6][]H2StartupRecord{previous.full, previous.resumed, previous.resumedDelayed, previous.pipelinedFull, previous.fullDelayedReply, previous.resumedWithReply}
+	for i, sample := range current {
+		switch {
+		case len(*sample) != 0:
+			missing[i] = time.Time{}
+		case len(old[i]) != 0:
+			if missing[i].IsZero() {
+				missing[i] = now
+			}
+			if now.Sub(missing[i]) < ticketShapeMaxAge {
+				*sample = old[i]
+			}
+		}
+	}
+	return p
+}
+
+// live drops the variants missing from refreshes for ticketShapeMaxAge,
+// which withPrevious drops only when the next refresh ends.
+func (p h2StartupProfiles) live(missing [6]time.Time, now time.Time) h2StartupProfiles {
+	variants := [6]*[]H2StartupRecord{&p.full, &p.resumed, &p.resumedDelayed, &p.pipelinedFull, &p.fullDelayedReply, &p.resumedWithReply}
+	for i, variant := range variants {
+		if !missing[i].IsZero() && now.Sub(missing[i]) >= ticketShapeMaxAge {
+			*variant = nil
+		}
+	}
+	return p
+}
+
+// records picks the profile for a connection. pipelined reports that the
+// client's data was already waiting when the startup began: a target that
+// starts HTTP/2 then reads the preface and request at once and groups its
+// greeting with them, otherwise it sends SETTINGS first. Firefox sends its
+// preface and request with its Finished; Chromium's arrive close behind it,
+// and which grouping a target gives them follows from that race.
+func (p h2StartupProfiles) records(resumed, firefox, pipelined bool) []H2StartupRecord {
 	if firefox {
 		if resumed && len(p.resumedWithReply) != 0 {
 			return p.resumedWithReply
 		}
-		if !resumed && len(p.firefoxFull) != 0 {
-			return p.firefoxFull
+		if !resumed && len(p.pipelinedFull) != 0 {
+			return p.pipelinedFull
 		}
 	}
-	if !resumed && !firefox && len(p.fullDelayedReply) != 0 {
-		return p.fullDelayedReply
+	if !resumed && !firefox {
+		// Prefer the variant the arrival calls for, then any measured one.
+		order := [3][]H2StartupRecord{p.fullDelayedReply, p.full, p.pipelinedFull}
+		if pipelined {
+			order = [3][]H2StartupRecord{p.pipelinedFull, p.fullDelayedReply, p.full}
+		}
+		for _, records := range order {
+			if len(records) != 0 {
+				return records
+			}
+		}
+		return nil
 	}
 	if resumed && firefox && len(p.resumedDelayed) != 0 {
 		return p.resumedDelayed
@@ -81,6 +125,7 @@ type h2StartupSnapshot struct {
 	profiles h2StartupProfiles
 	probed   time.Time
 	running  bool
+	missing  [6]time.Time
 }
 
 // The peer may send SETTINGS before seeing the client preface. With an
@@ -91,28 +136,31 @@ const h2PrefaceDelay = 60 * time.Millisecond
 // background. An unreachable target does not erase the last measurement.
 func detectH2Startup(config *Config, key, sni string) h2StartupProfiles {
 	pending := &h2StartupSnapshot{probed: time.Now(), running: true}
-	if value, loaded := h2StartupRecords.LoadOrStore(key, pending); loaded {
+	var served h2StartupProfiles
+	if value, loaded := config.h2StartupRecords.LoadOrStore(key, pending); loaded {
 		previous := value.(*h2StartupSnapshot)
+		served = previous.profiles.live(previous.missing, time.Now())
 		interval := ticketShapeRefresh
-		if len(previous.profiles.full) == 0 && len(previous.profiles.resumed) == 0 {
+		if len(served.full) == 0 && len(served.resumed) == 0 {
 			interval = time.Minute
 		}
 		if previous.running || time.Since(previous.probed) < interval {
-			return previous.profiles
+			return served
 		}
 		pending.profiles = previous.profiles
-		if !h2StartupRecords.CompareAndSwap(key, previous, pending) {
-			return previous.profiles
+		pending.missing = previous.missing
+		if !config.h2StartupRecords.CompareAndSwap(key, previous, pending) {
+			return served
 		}
 	}
 	go func() {
 		profiles := measureH2Startup(config, sni)
-		if len(profiles.full) == 0 && len(profiles.resumed) == 0 {
-			profiles = pending.profiles
-		}
-		h2StartupRecords.Store(key, &h2StartupSnapshot{profiles: profiles, probed: time.Now()})
+		now := time.Now()
+		missing := pending.missing
+		profiles = profiles.withPrevious(pending.profiles, &missing, now)
+		config.h2StartupRecords.Store(key, &h2StartupSnapshot{profiles: profiles, probed: now, missing: missing})
 	}()
-	return pending.profiles
+	return served
 }
 
 func measureH2Startup(config *Config, sni string) h2StartupProfiles {
@@ -177,9 +225,9 @@ func measureH2Startup(config *Config, sni string) h2StartupProfiles {
 	// when the target sends the greeting together, with or without the reply.
 	// When control frames arrive separately, use the control-only profile.
 	if len(withReply.full) == 1 {
-		profiles.firefoxFull = withReply.full
+		profiles.pipelinedFull = withReply.full
 	} else if len(fast.full) == 1 {
-		profiles.firefoxFull = fast.full
+		profiles.pipelinedFull = fast.full
 	}
 	if len(withDelayedReply) == 2 && slices.Contains(withDelayedReply[0].Frames, H2WindowUpdate) &&
 		endsWithH2Reply(withDelayedReply) {
@@ -224,8 +272,10 @@ func h2StartupRequest(sni string) []byte {
 	return append(frame, headers.Bytes()...)
 }
 
-const h2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-const h2EmptySettings = "\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+const (
+	h2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+	h2EmptySettings = "\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+)
 
 // Chrome and Firefox advertise a 64 KiB HPACK table. Some targets emit a
 // table size update in their first response only after seeing this setting.
@@ -238,10 +288,14 @@ type recordReader struct {
 	header    [recordHeaderLen]byte
 	remaining int
 	length    int
+	budget    int
 }
 
 func (c *recordReader) Read(b []byte) (int, error) {
 	if c.remaining == 0 {
+		if c.budget < len(c.header) {
+			return 0, errProbeLimit
+		}
 		if len(b) < len(c.header) {
 			return 0, io.ErrShortBuffer
 		}
@@ -250,6 +304,10 @@ func (c *recordReader) Read(b []byte) (int, error) {
 		}
 		c.remaining = int(binary.BigEndian.Uint16(c.header[3:]))
 		c.length = len(c.header) + c.remaining
+		if c.length > c.budget {
+			return 0, errProbeLimit
+		}
+		c.budget -= c.length
 		return copy(b, c.header[:]), nil
 	}
 	n, err := c.Conn.Read(b[:min(len(b), c.remaining)])
@@ -277,10 +335,10 @@ func probeH2Startup(config *Config, sni string, prefaceDelay time.Duration, repl
 		}
 	}
 
-	wire := &recordReader{Conn: target}
+	wire := &recordReader{Conn: target, budget: maxProbeBytes}
 	recorder := &ticketRecorder{replay: replay}
 	conn, err := probeClient(wire, &utls.Config{
-		ServerName: sni, InsecureSkipVerify: true, ClientSessionCache: recorder,
+		ServerName: sni, InsecureSkipVerify: sni == "", ClientSessionCache: recorder,
 	}, 2, replay != nil)
 	if err != nil || conn.HandshakeContext(ctx) != nil {
 		return sample
@@ -291,7 +349,7 @@ func probeH2Startup(config *Config, sni string, prefaceDelay time.Duration, repl
 	}
 	sample.resumed = state.DidResume
 	defer func() {
-		if tickets := recorder.take(); len(tickets) > 0 {
+		if tickets, overflow := recorder.take(); len(tickets) > 0 && !overflow {
 			sample.ticket = tickets[0]
 		}
 	}()

@@ -604,7 +604,8 @@ type Config struct {
 	// X25519, as before X25519MLKEM768 became required.
 	AllowX25519 bool
 
-	Mldsa65Key *mldsa.PrivateKey
+	Mldsa65Key       *mldsa.PrivateKey
+	h2StartupRecords sync.Map
 
 	// BrowserMode enables target probes and browser behavior for clients
 	// that request it in their authenticated REALITY handshake.

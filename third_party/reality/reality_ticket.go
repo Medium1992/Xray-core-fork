@@ -31,6 +31,61 @@ import (
 // a client asks for tickets.
 const realityTicketsFlag = 1
 
+// Keep the authenticated ClientHello keys in acceptance order. A duplicate
+// refreshes neither the expiration nor the position of the entry.
+type seenTicketHello struct {
+	key     [32]byte
+	expires time.Time
+}
+
+type ticketHelloCache struct {
+	sync.Mutex
+	size    int
+	entries map[[32]byte]*list.Element
+	order   list.List
+}
+
+var ticketHellos = ticketHelloCache{
+	size:    sessionCacheSize,
+	entries: make(map[[32]byte]*list.Element),
+}
+
+func (s *ticketHelloCache) accept(key [32]byte, now, expires time.Time, remember bool) bool {
+	s.Lock()
+	defer s.Unlock()
+	if entry := s.entries[key]; entry != nil {
+		if now.Before(entry.Value.(seenTicketHello).expires) {
+			return false
+		}
+		s.order.Remove(entry)
+		delete(s.entries, key)
+	}
+	if !remember {
+		return true
+	}
+	if s.order.Len() == s.size {
+		oldest := s.order.Front()
+		delete(s.entries, oldest.Value.(seenTicketHello).key)
+		s.order.Remove(oldest)
+	}
+	s.entries[key] = s.order.PushBack(seenTicketHello{key: key, expires: expires})
+	return true
+}
+
+func (s *ticketHelloCache) acceptClientHello(hs *serverHandshakeStateTLS13, now time.Time, validBinder bool) bool {
+	if !hs.c.realityTickets || len(hs.clientHello.pskBinders) == 0 {
+		return true
+	}
+	// Hash the same transcript the selected binder covers, including the
+	// restored session ID. Changing unselected binders cannot create a
+	// new entry. Only a verified offer can add an entry.
+	transcript, err := hs.clientHello.marshalWithoutBinders()
+	if err != nil {
+		return false
+	}
+	return s.accept(sha256.Sum256(transcript), now, now.Add(maxSessionTicketLifetime+time.Minute), validBinder)
+}
+
 // recordsKey is the key of GlobalPostHandshakeRecordsLens and
 // GlobalTicketShapes for this ClientHello.
 func recordsKey(config *Config, hello *clientHelloMsg) (key string, alpn int) {
@@ -59,12 +114,22 @@ func pskAAD(original []byte, binders [][]byte) []byte {
 	return aad
 }
 
-// realityTicketKeys derives the session ticket key from the private key.
+// ticketKeyMaterial includes every private key used to authenticate the
+// full handshake. Adding, rotating, or removing ML-DSA invalidates tickets.
+func (c *Config) ticketKeyMaterial() []byte {
+	material := c.PrivateKey.Bytes()
+	if c.Mldsa65Key != nil {
+		material = append(material, c.Mldsa65Key.Bytes()...)
+	}
+	return material
+}
+
+// realityTicketKeys derives the session ticket key from the server's keys.
 func (c *Config) realityTicketKeys() []ticketKey {
 	if c.PrivateKey == nil {
 		return nil
 	}
-	secret, err := hkdf.Key(sha256.New, c.PrivateKey.Bytes(), nil, "REALITY session ticket", 32)
+	secret, err := hkdf.Key(sha256.New, c.ticketKeyMaterial(), nil, "REALITY session ticket", 32)
 	if err != nil {
 		return nil
 	}
@@ -77,6 +142,9 @@ func (c *Config) realityTicketKeys() []ticketKey {
 // never accepts its tickets back, REALITY's carry random bytes it never
 // accepts either.
 func (c *Conn) ticketMsgs(shape *TicketShape, recordLen, n int) [][]byte {
+	if shape == nil || !shape.Issues {
+		return nil
+	}
 	suite := cipherSuiteTLS13ByID(c.cipherSuite)
 	keys := c.config.realityTicketKeys()
 	if _, ok := c.out.cipher.(aead); suite == nil || !ok || c.resumptionSecret == nil || keys == nil || n < 1 {
@@ -193,7 +261,7 @@ func (hs *serverHandshakeStateTLS13) realityResume(shape *TicketShape) bool {
 		len(ch.pskIdentities) != len(ch.pskBinders) {
 		return false
 	}
-	if !shape.Resumes {
+	if !shape.canResume() {
 		return false
 	}
 	// The target's live answer has the flight its probe had.
@@ -240,10 +308,21 @@ func (hs *serverHandshakeStateTLS13) realityResume(shape *TicketShape) bool {
 	c.out.handshakeLen[2] = ee
 	c.out.handshakeLen[3] = 0
 	c.out.handshakeLen[4] = 0
-	if c.out.handshakeLen[6] != 0 && shape.FlightRecords == 4 && len(shape.ResRecords) > 2 {
-		c.out.handshakeLen[6] = shape.ResRecords[2]
+	if c.out.handshakeLen[6] != 0 {
+		c.out.handshakeLen[6] = shape.resumedTicketRecordLength()
 	}
 	return true
+}
+
+func (shape *TicketShape) canResume() bool {
+	return shape.Resumes && shape.HelloDelta == 6
+}
+
+func (shape *TicketShape) resumedTicketRecordLength() int {
+	if shape.FlightRecords == 4 && shape.ResTickets > 0 && len(shape.ResRecords) > 2 {
+		return shape.ResRecords[2]
+	}
+	return 0
 }
 
 // insertPSKExtension adds pre_shared_key, selecting the first identity, to
@@ -294,12 +373,19 @@ func (hs *serverHandshakeStateTLS13) postHandshakeRecords(lens []int) ([]int, []
 		tickets = make([]int, len(lens))
 		total, perRecord = shape.ResTickets-inFlight, shape.ResTicketsPerRecord
 	}
+	count := 0
 	for i := range tickets {
 		if total <= 0 || perRecord < 1 {
 			break
 		}
 		tickets[i] = min(perRecord, total)
 		total -= tickets[i]
+		count++
+	}
+	if len(hs.c.h2Startup) != 0 {
+		// Only records identified by a ticket profile may be replaced
+		// by the HTTP/2 startup profile.
+		lens, tickets = lens[:count], tickets[:count]
 	}
 	return lens, tickets
 }
@@ -310,7 +396,7 @@ func (hs *serverHandshakeStateTLS13) postHandshakeRecords(lens []int) ([]int, []
 // expire, as nginx's session cache does: a used one is still refused with
 // a wrong binder there.
 func (c *Config) realityTicketSession(shape *TicketShape, label []byte, take bool) *SessionState {
-	if !bytes.HasPrefix(label, shape.Prefix) {
+	if c.PrivateKey == nil || !bytes.HasPrefix(label, shape.Prefix) {
 		return nil
 	}
 	var session *SessionState
@@ -326,7 +412,7 @@ func (c *Config) realityTicketSession(shape *TicketShape, label []byte, take boo
 		return nil
 	}
 	age := c.time().Sub(time.Unix(int64(session.createdAt), 0))
-	if age < -time.Minute || age > time.Duration(shape.Lifetime)*time.Second {
+	if age < -time.Minute || age > min(time.Duration(shape.Lifetime)*time.Second, maxSessionTicketLifetime) {
 		return nil
 	}
 	return session
@@ -345,35 +431,37 @@ func checkBinder(suite *cipherSuiteTLS13, session *SessionState, ch *clientHello
 	return earlySecret, hmac.Equal(ch.pskBinders[0], suite.finishedHash(earlySecret.ResumptionBinderKey(), transcript))
 }
 
-// ticketRefusal returns what the target sends back to one of its own
-// tickets offered with a wrong binder, if the ClientHello offers one of
-// REALITY's tickets so, authenticated or not. A censor that saw the ticket
-// on the wire cannot compute its binder; a server that issued the ticket
-// refuses it, where the target, which does not know it, would go on with a
-// full handshake.
-func (hs *serverHandshakeStateTLS13) ticketRefusal() *TicketShape {
+// inspectTicketHello checks whether the offer authenticates a ticket we
+// issued. For a known ticket with an invalid binder, it returns the
+// target's measured refusal, when available.
+func (hs *serverHandshakeStateTLS13) inspectTicketHello() (refusal *TicketShape, validBinder, invalidBinder bool) {
 	ch := hs.clientHello
 	if len(ch.pskIdentities) == 0 || len(ch.pskIdentities) != len(ch.pskBinders) ||
 		!slices.Contains(ch.pskModes, pskModeDHE) {
-		return nil
+		return nil, false, false
 	}
 	key, _ := recordsKey(hs.c.config, ch)
 	shape := LoadTicketShape(key)
-	if shape == nil || !shape.Resumes || !shape.RefusesBadBinder {
-		return nil
+	if shape == nil || !shape.Resumes {
+		return nil, false, false
 	}
 	session := hs.c.config.realityTicketSession(shape, ch.pskIdentities[0].label, false)
 	if session == nil {
-		return nil
+		return nil, false, false
 	}
 	suite := cipherSuiteTLS13ByID(session.cipherSuite)
 	if suite == nil {
-		return nil
+		return nil, false, false
 	}
 	if _, ok := checkBinder(suite, session, ch); ok {
-		return nil
+		return nil, true, false
 	}
-	return shape
+	// A refusal measured more than ticketShapeMaxAge ago no longer says
+	// how the target answers: the hello goes to the target.
+	if shape.RefusesBadBinder && time.Since(shape.refusalAt) < ticketShapeMaxAge {
+		return shape, false, true
+	}
+	return nil, false, true
 }
 
 // statefulTicket returns a ticket of ticketLen bytes that is only an id of
@@ -420,9 +508,9 @@ func newSessionCache(size int) *sessionCache {
 	return &sessionCache{size: size, entries: make(map[string]*list.Element)}
 }
 
-// cacheKey scopes id to the private key of config.
+// cacheKey scopes id to the full authentication policy of config.
 func cacheKey(config *Config, id []byte) string {
-	scope := sha256.Sum256(config.PrivateKey.Bytes())
+	scope := sha256.Sum256(config.ticketKeyMaterial())
 	return string(scope[:16]) + string(id)
 }
 

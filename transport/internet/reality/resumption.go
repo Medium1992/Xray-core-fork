@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
-	"math/rand/v2"
 	"encoding/hex"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"sync"
@@ -98,10 +98,28 @@ func (s *ticketStore) fail(key string) {
 	if s.failed == nil {
 		s.failed = make(map[string]time.Time)
 	}
-	if len(s.failed) >= ticketServers {
-		clear(s.failed)
+	now := time.Now()
+	if _, exists := s.failed[key]; !exists && len(s.failed) >= ticketServers {
+		for name, failedAt := range s.failed {
+			if now.Sub(failedAt) >= ticketBackoff {
+				delete(s.failed, name)
+			}
+		}
 	}
-	s.failed[key] = time.Now()
+	if _, exists := s.failed[key]; !exists && len(s.failed) >= ticketServers {
+		// Every marker is active: the oldest goes, and its server's tickets
+		// with it, so none is offered there before its backoff would end.
+		var oldest string
+		var earliest time.Time
+		for name, failedAt := range s.failed {
+			if earliest.IsZero() || failedAt.Before(earliest) {
+				oldest, earliest = name, failedAt
+			}
+		}
+		delete(s.failed, oldest)
+		delete(s.sessions, oldest)
+	}
+	s.failed[key] = now
 }
 
 func (s *ticketStore) pop(key string) *utls.ClientSessionState {
@@ -318,6 +336,20 @@ func verifyDelay(fingerprint utls.ClientHelloID, key string) func() time.Duratio
 		}
 		return from + time.Duration(rand.Int64N(int64(to-from)))
 	}
+}
+
+// applicationDataGap returns how long after its handshake a browser sends
+// its first application data, or nil when it sends it with its Finished.
+// Chrome 157 left 0.25 to 1.2 ms on the stand. The gap decides what a
+// target that reads after its handshake finds waiting, which changes how
+// nginx groups its HTTP/2 greeting.
+func applicationDataGap(fingerprint utls.ClientHelloID) func() time.Duration {
+	switch fingerprint.Client {
+	case "Chrome", "Edge":
+		const from, to = 250 * time.Microsecond, 1200 * time.Microsecond
+		return func() time.Duration { return from + time.Duration(rand.Int64N(int64(to-from))) }
+	}
+	return nil
 }
 
 // verifyCacheTTL is how long Chromium keeps a certificate's verification.

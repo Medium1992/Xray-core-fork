@@ -34,8 +34,12 @@ Debian packages unpacked under `root/` (`install.sh`), Google Chrome stable,
 Caddy checked against its release checksums, a copy of tcpdump (the system
 one has an AppArmor profile that refuses signals and writes to hidden
 directories), a test CA, and `xray-new`/`xray-old` built from the two refs.
-Firefox comes from the system. Angie and Envoy are included when their
-binaries are on the stand's PATH.
+Native runs use the system Firefox for the `firefox` scenario. Before
+running the full `browsers` group, install Edge under
+`$STAND_WORK/root/opt/microsoft/msedge/` and extract Firefox 156.0.1 and
+160.0 under `$STAND_WORK/root/opt/firefox-156.0.1/` and
+`$STAND_WORK/root/opt/firefox-160.0/`, respectively. Angie and Envoy are
+included when their binaries are on the stand's PATH.
 
 ### Docker Desktop
 
@@ -103,6 +107,8 @@ pasta --config-net -q -- unshare -m python3 stand.py real www.microsoft.com ya.r
 for Chrome, which shuffles them, the order for Firefox), PSK identity length,
 and the server records of full and resumed handshakes by type and length
 (CertificateVerify within 2 bytes).
+The HTTP/2 comparison reports an incomplete capture if tshark cannot
+associate SETTINGS or its ACK with a single TLS record in a packet.
 
 ## XHTTP startup records
 
@@ -113,6 +119,16 @@ probes. Ticket and HTTP/2 startup probes are enabled by the inbound
 option. On an enabled inbound, a client without browser mode follows
 the original per-connection path, including the original post-handshake
 records and HTTP/2 startup.
+
+The enabled inbound makes background TLS probes for each target, server
+name and ALPN profile. For HTTP/2 it also measures startup with a
+`GET /` request. See [replay protection and ticket refusal](#replay-protection-and-ticket-refusal)
+for its scope.
+
+Xray in this branch uses Joly's baseline uTLS presets. The modern
+browser captures also serve as reference data for the separate uTLS
+preset update. In particular, the baseline Firefox preset uses full
+handshakes when it cannot offer a ticket.
 
 Capture Chrome and Firefox navigating to the target URL used for the
 probes. The Chrome references also include a page that performs
@@ -185,10 +201,19 @@ REALITY also sends a `GET /` with the preface, advertises the browsers'
 64 KiB HPACK table, and stops reading once the server's SETTINGS ACK
 arrives. If the target
 combines startup controls and response headers, XHTTP can use that record
-for its controls and as much of its own response as fits. Chromium full
-handshakes use a delayed preface sample to capture SETTINGS arriving
-before the combined ACK and response. Firefox can use a sample that
-combines the greeting into one record, with or without a response.
+for its controls and as much of its own response as fits. For a full
+Chromium handshake the grouping follows the client's arrival, as the
+target's does: once its tickets are out, REALITY checks whether client
+data already waits (on Linux, also in the kernel, unless a FinalMask
+wrapper reports `Splice()` false, as Sudoku and the server-side fragment
+mask do; then only bytes already read count). If it does, the
+combined sample is used; otherwise the delayed one, with SETTINGS first.
+Chrome sends its first data 0.25-1.2 ms after its Finished, so the REALITY
+client schedules its first data that long after its handshake for Chrome
+and Edge (the scheduled delay: on loopback the measured gap between the
+Finished write and the first data write was 0.70-2.12 ms); nginx gave Chrome 157 both
+groupings within one run. Firefox can use a sample that combines the
+greeting into one record, with or without a response.
 Resumed Chromium prefers the
 immediate control-only sample. If the response does not arrive in time,
 XHTTP releases the controls. The response portion of a record can vary
@@ -199,6 +224,24 @@ through.
 Individual browser connections to a target can use either grouping. Compare each
 handshake type using the selected PSK identity in ServerHello. An offer
 in ClientHello also appears when the target declines to resume.
+
+## Findings (2026-11-18, this PR's uTLS pin)
+
+The 2026-11-16 findings below used the Firefox 156, Edge 157 and Safari
+26.3 presets that are now proposed in Jolymmiles/utls#1. This PR keeps the
+pinned uTLS until that lands, and Firefox and Edge depend on it.
+
+- XHTTP, Chrome, through REALITY, against Chrome 157 straight to the
+  target. nginx at RTT 0 and 60 ms: full and resumed startups match.
+  nginx at 150 ms: only the response bytes in the second record differ
+  (146 against 148). Caddy and HAProxy at 60 ms: match. nginx gave Chrome
+  `[62, 146]`, `[188]` and `[62, 31]` within one run, which is why the
+  grouping follows the client's arrival.
+- XHTTP, Firefox: the pinned Firefox 148 preset sends neither
+  `session_ticket` nor `psk_key_exchange_modes`. The client therefore does
+  not ask for tickets, and the server answers it on the legacy path,
+  without HTTP/2 shaping. Every target differs from Firefox 160 until the
+  uTLS update.
 
 ## Findings (2026-11-16)
 
@@ -232,14 +275,21 @@ the time the client takes for its Finished.
   ends in the target's certificate and a dropped connection; the client then
   offers no ticket there for 10 minutes.
 
-### Known limitation: replay of a resumed ClientHello
+### Replay protection and ticket refusal
 
-A captured ClientHello that offers a valid REALITY-issued ticket can be
-replayed while the ticket and the authenticated ClientHello are still
-accepted. REALITY can return `selected_identity` in its plaintext
-ServerHello. The target rejects the same ticket and performs a full
-handshake. An active observer with the capture can distinguish those
-responses. The replay test is in the `edge` group.
+The server records authenticated browser-mode ClientHellos with a valid
+ticket and binder before it starts a REALITY handshake. A repeated
+ClientHello goes to the target. The bounded history holds up to 40,000 entries per
+process in one process-wide cache, shared by all inbounds. Protection
+for an entry ends when it expires, is evicted, or the process restarts.
+Independent replicas have independent histories. The `edge` group
+captures the replay scenario.
+
+For an invalid binder, the probe distinguishes a TLS alert, a closed
+read side, a reset, and a read deadline with no response. Silence must
+be observed twice before it is stored. A TCP reset
+can be reproduced on a connection that exposes its underlying TCP
+socket. The delay is measured at the target and includes network jitter.
 
 ## Not covered yet
 

@@ -73,7 +73,25 @@ type UConn struct {
 	ServerName          string
 	AuthKey             []byte
 	Verified            bool
+	browserTickets      *connTickets
 	suppressCloseNotify atomic.Bool
+
+	// firstData is when the first application data may go: Chromium
+	// sends it a little after its Finished, not with it.
+	firstData time.Time
+	dataOnce  sync.Once
+}
+
+// Write holds the first application data until firstData.
+func (c *UConn) Write(b []byte) (int, error) {
+	c.dataOnce.Do(c.waitFirstData)
+	return c.UConn.Write(b)
+}
+
+func (c *UConn) waitFirstData() {
+	if wait := time.Until(c.firstData); wait > 0 {
+		time.Sleep(wait)
+	}
 }
 
 func (c *UConn) SuppressCloseNotify() {
@@ -148,6 +166,69 @@ func (c *Config) UsesBrowserProfile() bool {
 	return fingerprint != nil && resumesSessions(*fingerprint)
 }
 
+// seal writes the REALITY session ID into the built ClientHello and derives
+// the key the server proves it holds. The session ID authenticates the whole
+// hello, so nothing may change the hello afterwards.
+func (c *UConn) seal() error {
+	config := c.Config
+	localAddr := c.LocalAddr().String()
+	hello := c.HandshakeState.Hello
+	// The legacy session ID is 32 bytes at a fixed offset: after version,
+	// random and its length byte.
+	if hello == nil || len(hello.Raw) < 39+32 || hello.Raw[38] != 32 {
+		return errors.New("REALITY: the ClientHello of fingerprint ", c.ClientHelloID.Client, c.ClientHelloID.Version, " has no session ID to seal")
+	}
+	hello.SessionId = make([]byte, 32)
+	copy(hello.Raw[39:], hello.SessionId) // the fixed location of `Session ID`
+	hello.SessionId[0] = core.Version_x
+	hello.SessionId[1] = core.Version_y
+	hello.SessionId[2] = core.Version_z
+	hello.SessionId[3] = 0 // reserved
+	if c.browserTickets != nil {
+		hello.SessionId[3] = realityTicketsFlag
+	}
+	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+	copy(hello.SessionId[8:], config.ShortId)
+	if config.Show {
+		fmt.Printf("REALITY localAddr: %v\thello.SessionId[:16]: %v\n", localAddr, hello.SessionId[:16])
+	}
+	publicKey, err := ecdh.X25519().NewPublicKey(config.PublicKey)
+	if err != nil {
+		return errors.New("REALITY: nil publicKey").Base(err)
+	}
+	ecdhe := c.HandshakeState.State13.KeyShareKeys.Ecdhe
+	if ecdhe == nil {
+		ecdhe = c.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
+	}
+	if ecdhe == nil {
+		return errors.New("Current fingerprint ", c.ClientHelloID.Client, c.ClientHelloID.Version, " does not support TLS 1.3, REALITY handshake cannot establish.")
+	}
+	if c.AuthKey, err = ecdhe.ECDH(publicKey); err != nil {
+		return errors.New("REALITY: nil sharedKey").Base(err)
+	}
+	if c.AuthKey, err = hkdf.Key(sha256.New, c.AuthKey, hello.Random[:20], "REALITY", 32); err != nil {
+		return errors.New("REALITY: nil authKey").Base(err)
+	}
+	aead := crypto.NewAesGcm(c.AuthKey)
+	if config.Show {
+		fmt.Printf("REALITY localAddr: %v\tuConn.AuthKey[:16]: %v\tAEAD: %T\n", localAddr, c.AuthKey[:16], aead)
+	}
+	aad := hello.Raw
+	psk := offeredPSK(c.UConn)
+	if psk != nil {
+		aad = pskAAD(hello.Raw, psk.Binders)
+	}
+	aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], aad)
+	copy(hello.Raw[39:], hello.SessionId)
+	if psk != nil {
+		// The binders cover the session id written above.
+		if err := psk.PatchBuiltHello(hello); err != nil && err != io.EOF {
+			return errors.New("REALITY: failed to bind the ticket").Base(err)
+		}
+	}
+	return nil
+}
+
 func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
@@ -190,84 +271,31 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		utlsConfig.AlwaysIncludePSK = true
 		utlsConfig.InsecureSkipTimeVerify = true // REALITY's certificate has no validity
 	}
+	uConn.browserTickets = cache
 	// uTLS takes the ticket from the cache when it builds the ClientHello.
 	offered := cache != nil && cache.session != nil
-	var spec *utls.ClientHelloSpec
+	var options []tls.UClientOption
 	if offered {
-		spec = resumptionSpec(*fingerprint, cache.session)
+		if spec := resumptionSpec(*fingerprint, cache.session); spec != nil {
+			options = append(options, tls.WithClientHelloSpec(spec))
+		}
 	}
-	if spec != nil {
-		uConn.UConn = utls.UClient(c, utlsConfig, utls.HelloCustom)
-		if err := uConn.ApplyPreset(spec); err != nil {
-			c.Close()
-			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
-		}
-	} else {
-		uConn.UConn = utls.UClient(c, utlsConfig, *fingerprint)
+	var err error
+	if uConn.UConn, err = tls.NewUClient(c, utlsConfig, *fingerprint, options...); err != nil {
+		c.Close()
+		return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
 	}
-	{
-		if err := uConn.BuildHandshakeState(); err != nil {
+	if len(options) > 0 && offeredPSK(uConn.UConn) == nil {
+		// uTLS dropped the ticket: the browser's resumption hello without
+		// it is a hello the browser never sends.
+		if uConn.UConn, err = tls.NewUClient(c, utlsConfig, *fingerprint); err != nil {
 			c.Close()
-			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
+			return nil, errors.New("REALITY: failed to rebuild the full ClientHello").Base(err)
 		}
-		if err := tls.FixRandomizedHello(uConn.UConn); err != nil {
-			c.Close()
-			return nil, errors.New("REALITY: failed to build the ClientHello").Base(err)
-		}
-		hello := uConn.HandshakeState.Hello
-		hello.SessionId = make([]byte, 32)
-		copy(hello.Raw[39:], hello.SessionId) // the fixed location of `Session ID`
-		hello.SessionId[0] = core.Version_x
-		hello.SessionId[1] = core.Version_y
-		hello.SessionId[2] = core.Version_z
-		hello.SessionId[3] = 0 // reserved
-		if browser {
-			hello.SessionId[3] = realityTicketsFlag
-		}
-		binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
-		copy(hello.SessionId[8:], config.ShortId)
-		if config.Show {
-			fmt.Printf("REALITY localAddr: %v\thello.SessionId[:16]: %v\n", localAddr, hello.SessionId[:16])
-		}
-		publicKey, err := ecdh.X25519().NewPublicKey(config.PublicKey)
-		if err != nil {
-			c.Close()
-			return nil, errors.New("REALITY: nil publicKey").Base(err)
-		}
-		ecdhe := uConn.HandshakeState.State13.KeyShareKeys.Ecdhe
-		if ecdhe == nil {
-			ecdhe = uConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
-		}
-		if ecdhe == nil {
-			c.Close()
-			return nil, errors.New("Current fingerprint ", uConn.ClientHelloID.Client, uConn.ClientHelloID.Version, " does not support TLS 1.3, REALITY handshake cannot establish.")
-		}
-		if uConn.AuthKey, err = ecdhe.ECDH(publicKey); err != nil {
-			c.Close()
-			return nil, errors.New("REALITY: nil sharedKey").Base(err)
-		}
-		if uConn.AuthKey, err = hkdf.Key(sha256.New, uConn.AuthKey, hello.Random[:20], "REALITY", 32); err != nil {
-			c.Close()
-			return nil, errors.New("REALITY: nil authKey").Base(err)
-		}
-		aead := crypto.NewAesGcm(uConn.AuthKey)
-		if config.Show {
-			fmt.Printf("REALITY localAddr: %v\tuConn.AuthKey[:16]: %v\tAEAD: %T\n", localAddr, uConn.AuthKey[:16], aead)
-		}
-		aad := hello.Raw
-		psk := offeredPSK(uConn.UConn)
-		if psk != nil {
-			aad = pskAAD(hello.Raw, psk.Binders)
-		}
-		aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], aad)
-		copy(hello.Raw[39:], hello.SessionId)
-		if psk != nil {
-			// The binders cover the session id written above.
-			if err := psk.PatchBuiltHello(hello); err != nil && err != io.EOF {
-				c.Close()
-				return nil, errors.New("REALITY: failed to bind the ticket").Base(err)
-			}
-		}
+	}
+	if err := uConn.seal(); err != nil {
+		c.Close()
+		return nil, err
 	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		if offered {
@@ -275,6 +303,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		}
 		uConn.Close()
 		return nil, err
+	}
+	if gap := applicationDataGap(*fingerprint); config.Browser == "auto" && gap != nil {
+		uConn.firstData = time.Now().Add(gap())
 	}
 	if browser {
 		if uConn.ConnectionState().DidResume {

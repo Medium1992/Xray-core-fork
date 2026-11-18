@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	gotls "crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -52,8 +54,10 @@ func TestProbeH2ReadsStartupAfterClientPreface(t *testing.T) {
 		}
 		// As in the HAProxy capture, SETTINGS and its acknowledgement
 		// share one TLS record, after the target sees the client's preface.
-		settings := []byte{0, 0, 18, 4, 0, 0, 0, 0, 0,
-			0, 8, 0, 0, 0, 1, 0, 4, 0, 1, 0, 0, 0, 3, 0, 0, 0, 100}
+		settings := []byte{
+			0, 0, 18, 4, 0, 0, 0, 0, 0,
+			0, 8, 0, 0, 0, 1, 0, 4, 0, 1, 0, 0, 0, 3, 0, 0, 0, 100,
+		}
 		ack := []byte{0, 0, 0, 4, 1, 0, 0, 0, 0}
 		_, err = conn.Write(append(settings, ack...))
 		serverErr <- err
@@ -108,7 +112,7 @@ func TestMeasureH2StartupProbesResumedConnections(t *testing.T) {
 		{Length: 31, Frames: []H2StartupFrame{H2SettingsAck}},
 	}
 	wantResumed := []H2StartupRecord{{Length: 40, Frames: []H2StartupFrame{H2Settings, H2SettingsAck}}}
-	if !reflect.DeepEqual(profiles.records(false, false), wantFull) || !reflect.DeepEqual(profiles.records(true, false), wantResumed) {
+	if !reflect.DeepEqual(profiles.records(false, false, false), wantFull) || !reflect.DeepEqual(profiles.records(true, false, false), wantResumed) {
 		t.Fatalf("startup profiles %+v, want full %+v and resumed %+v", profiles, wantFull, wantResumed)
 	}
 	for range 4 {
@@ -129,10 +133,10 @@ func TestFirefoxUsesDelayedStartupWhenResumed(t *testing.T) {
 	profiles := h2StartupProfiles{full: delayed, resumed: fast, resumedDelayed: delayed}
 	firefox := &clientHelloMsg{extensions: []uint16{28, 34}}
 	chrome := &clientHelloMsg{ticketSupported: true}
-	if got := profiles.records(true, hasFirefoxH2Fingerprint(firefox)); !reflect.DeepEqual(got, delayed) {
+	if got := profiles.records(true, hasFirefoxH2Fingerprint(firefox), true); !reflect.DeepEqual(got, delayed) {
 		t.Fatalf("Firefox got %v, want %v", got, delayed)
 	}
-	if got := profiles.records(true, hasFirefoxH2Fingerprint(chrome)); !reflect.DeepEqual(got, fast) {
+	if got := profiles.records(true, hasFirefoxH2Fingerprint(chrome), true); !reflect.DeepEqual(got, fast) {
 		t.Fatalf("Chrome got %v, want %v", got, fast)
 	}
 }
@@ -140,12 +144,121 @@ func TestFirefoxUsesDelayedStartupWhenResumed(t *testing.T) {
 func TestFullBrowserH2ProfilesCanMixReplyAfterDifferentFrames(t *testing.T) {
 	chromium := []H2StartupRecord{{Length: 62}, {Length: 146, ResponseBytes: 115}}
 	firefox := []H2StartupRecord{{Length: 186, ResponseBytes: 115}}
-	profiles := h2StartupProfiles{fullDelayedReply: chromium, firefoxFull: firefox}
-	if got := profiles.records(false, false); !reflect.DeepEqual(got, chromium) {
+	profiles := h2StartupProfiles{fullDelayedReply: chromium, pipelinedFull: firefox}
+	if got := profiles.records(false, false, false); !reflect.DeepEqual(got, chromium) {
 		t.Errorf("Chromium got %v, want %v", got, chromium)
 	}
-	if got := profiles.records(false, true); !reflect.DeepEqual(got, firefox) {
+	if got := profiles.records(false, true, false); !reflect.DeepEqual(got, firefox) {
 		t.Errorf("Firefox got %v, want %v", got, firefox)
+	}
+}
+
+// A full Chromium handshake gets the grouping the target gives the same
+// arrival: with the preface and request already waiting when the startup
+// begins, nginx sends its controls and response in one record (Chrome 157
+// on the stand: 188); with nothing waiting, SETTINGS goes first (62, 31).
+func TestFullChromiumH2ProfileFollowsTheClientsArrival(t *testing.T) {
+	delayed := []H2StartupRecord{{Length: 62}, {Length: 31}}
+	delayedReply := []H2StartupRecord{{Length: 62}, {Length: 146, ResponseBytes: 115}}
+	pipelined := []H2StartupRecord{{Length: 186, ResponseBytes: 115}}
+	profiles := h2StartupProfiles{full: delayed, fullDelayedReply: delayedReply, pipelinedFull: pipelined}
+	if got := profiles.records(false, false, true); !reflect.DeepEqual(got, pipelined) {
+		t.Errorf("pipelined: got %v, want %v", got, pipelined)
+	}
+	if got := profiles.records(false, false, false); !reflect.DeepEqual(got, delayedReply) {
+		t.Errorf("not pipelined: got %v, want %v", got, delayedReply)
+	}
+	// A target that never groups the greeting has no pipelined sample:
+	// the delayed one with the reply goes first, as before.
+	profiles.pipelinedFull = nil
+	if got := profiles.records(false, false, true); !reflect.DeepEqual(got, delayedReply) {
+		t.Errorf("no pipelined sample: got %v, want %v", got, delayedReply)
+	}
+	// With only the pipelined sample measured, either arrival gets it.
+	only := h2StartupProfiles{pipelinedFull: pipelined}
+	if got := only.records(false, false, false); !reflect.DeepEqual(got, pipelined) {
+		t.Errorf("only a pipelined sample: got %v, want %v", got, pipelined)
+	}
+}
+
+func tcpPair(t *testing.T) (client, server net.Conn) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	client, err = net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	server, err = listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
+	return client, server
+}
+
+// inputPending sees bytes a read already took in, on any system.
+func TestInputPendingBuffered(t *testing.T) {
+	_, server := tcpPair(t) // nothing queued on the socket
+	if (&Conn{conn: server}).inputPending() {
+		t.Fatal("input pending on an idle socket")
+	}
+	if !(&Conn{conn: server, rawInput: bytes.NewBuffer([]byte{23})}).inputPending() {
+		t.Fatal("bytes already read were not seen")
+	}
+}
+
+// On Linux inputPending also sees the bytes the kernel holds.
+func TestInputPendingKernel(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the kernel's count is read on Linux only")
+	}
+	client, server := tcpPair(t)
+	c := &Conn{conn: server}
+	if _, err := client.Write([]byte{23, 3, 3, 0, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); !c.inputPending(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the kernel's bytes were not seen")
+		}
+	}
+}
+
+// maskConn stands for a FinalMask TCP wrapper; splice tells whether it
+// passes the stream through unchanged.
+type maskConn struct {
+	net.Conn
+	splice bool
+}
+
+func (c maskConn) RawConn() net.Conn { return c.Conn }
+func (c maskConn) Splice() bool      { return c.splice }
+
+// Under a mask that re-encodes the stream the socket's bytes are not the
+// client's data, so only a mask that passes the stream through is unwrapped.
+func TestInputPendingThroughMasks(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the kernel's count is read on Linux only")
+	}
+	client, server := tcpPair(t)
+	if _, err := client.Write([]byte{23, 3, 3, 0, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); !(&Conn{conn: server}).inputPending(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the kernel's bytes were not seen")
+		}
+	}
+	if !(&Conn{conn: maskConn{server, true}}).inputPending() {
+		t.Fatal("a pass-through mask hid the socket's bytes")
+	}
+	if (&Conn{conn: maskConn{server, false}}).inputPending() {
+		t.Fatal("bytes under a transforming mask counted as client data")
 	}
 }
 
@@ -187,24 +300,60 @@ func TestProbeH2MeasuresReplyInStartupRecord(t *testing.T) {
 	}
 }
 
+func TestH2StartupPartialRefresh(t *testing.T) {
+	old := h2StartupProfiles{
+		full:    []H2StartupRecord{{Length: 31}},
+		resumed: []H2StartupRecord{{Length: 44}},
+	}
+	full := []H2StartupRecord{{Length: 55}}
+	resumed := []H2StartupRecord{{Length: 66}}
+	for _, test := range []struct {
+		measured h2StartupProfiles
+		want     h2StartupProfiles
+	}{
+		{h2StartupProfiles{full: full}, h2StartupProfiles{full: full, resumed: old.resumed}},
+		{h2StartupProfiles{resumed: resumed}, h2StartupProfiles{full: old.full, resumed: resumed}},
+	} {
+		if got := test.measured.withPrevious(old, new([6]time.Time), time.Now()); !reflect.DeepEqual(got, test.want) {
+			t.Fatalf("merged startup profiles %+v, want %+v", got, test.want)
+		}
+	}
+}
+
+func TestH2StartupAgesIndividualVariants(t *testing.T) {
+	resumed := []H2StartupRecord{{Length: 44}}
+	reply := []H2StartupRecord{{Length: 31}}
+	old := h2StartupProfiles{resumed: resumed}
+	sample := h2StartupProfiles{resumedWithReply: reply}
+	var missing [6]time.Time
+	now := time.Now()
+	first := sample.withPrevious(old, &missing, now)
+	if !reflect.DeepEqual(first.resumed, resumed) || !reflect.DeepEqual(first.resumedWithReply, reply) {
+		t.Fatalf("partial refresh lost a live variant: %+v", first)
+	}
+	expired := sample.withPrevious(first, &missing, now.Add(ticketShapeMaxAge))
+	if len(expired.resumed) != 0 || !reflect.DeepEqual(expired.resumedWithReply, reply) {
+		t.Fatalf("only the stale variant should expire: %+v", expired)
+	}
+}
+
 func TestH2StartupRefreshKeepsLastProfileOnFailure(t *testing.T) {
 	key := t.Name()
-	t.Cleanup(func() { h2StartupRecords.Delete(key) })
 	full := []H2StartupRecord{{Length: 31, Frames: []H2StartupFrame{H2Settings}}}
 	old := &h2StartupSnapshot{
 		profiles: h2StartupProfiles{full: full},
 		probed:   time.Now().Add(-2 * ticketShapeRefresh),
 	}
-	h2StartupRecords.Store(key, old)
 	config := &Config{DialContext: func(context.Context, string, string) (net.Conn, error) {
 		return nil, net.ErrClosed
 	}}
+	config.h2StartupRecords.Store(key, old)
 	if got := detectH2Startup(config, key, "example.com").full; !reflect.DeepEqual(got, full) {
 		t.Fatalf("refresh returned %v, want %v", got, full)
 	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		value, _ := h2StartupRecords.Load(key)
+		value, _ := config.h2StartupRecords.Load(key)
 		snapshot := value.(*h2StartupSnapshot)
 		if !snapshot.running {
 			if snapshot.probed.After(old.probed) && reflect.DeepEqual(snapshot.profiles.full, full) {
@@ -215,6 +364,32 @@ func TestH2StartupRefreshKeepsLastProfileOnFailure(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("refresh did not finish")
+}
+
+// A variant missing from refreshes for ticketShapeMaxAge is not handed to
+// connections while the next refresh runs, nor by a snapshot whose refresh
+// is already running.
+func TestH2StartupDoesNotServeExpiredVariant(t *testing.T) {
+	full := []H2StartupRecord{{Length: 31, Frames: []H2StartupFrame{H2Settings}}}
+	resumed := []H2StartupRecord{{Length: 44, Frames: []H2StartupFrame{H2Settings}}}
+	for _, running := range []bool{false, true} {
+		key := fmt.Sprint(t.Name(), running)
+		var missing [6]time.Time
+		missing[0] = time.Now().Add(-ticketShapeMaxAge - time.Minute)
+		config := &Config{DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, net.ErrClosed
+		}}
+		config.h2StartupRecords.Store(key, &h2StartupSnapshot{
+			profiles: h2StartupProfiles{full: full, resumed: resumed},
+			probed:   time.Now().Add(-2 * ticketShapeRefresh),
+			running:  running,
+			missing:  missing,
+		})
+		got := detectH2Startup(config, key, "example.com")
+		if len(got.full) != 0 || !reflect.DeepEqual(got.resumed, resumed) {
+			t.Fatalf("running %v: served %+v, want only the live resumed variant", running, got)
+		}
+	}
 }
 
 type writtenRecords struct {

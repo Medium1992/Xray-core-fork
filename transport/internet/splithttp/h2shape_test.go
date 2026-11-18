@@ -247,6 +247,19 @@ func TestShapeConnPassesOtherProtocols(t *testing.T) {
 	}
 }
 
+func TestShapeConnCloseStopsStartupTimer(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	c := &shapeConn{Conn: local, state: 1, timer: time.NewTimer(time.Hour)}
+	defer c.timer.Stop()
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if c.state != 2 || c.timer.Stop() {
+		t.Fatal("closing a connection must stop its startup timer")
+	}
+}
+
 func TestAckConnWritesTheAcknowledgementAlone(t *testing.T) {
 	under := &writesConn{}
 	c := &ackConn{Conn: under}
@@ -258,9 +271,38 @@ func TestAckConnWritesTheAcknowledgementAlone(t *testing.T) {
 	if len(under.writes) != 2 || !bytes.Equal(under.writes[0], ack) || !bytes.Equal(under.writes[1], wu) {
 		t.Fatalf("writes %x", under.writes)
 	}
-	c.Write(wu)
-	if len(under.writes) != 3 {
-		t.Fatal("other writes pass")
+	later := append(bytes.Clone(ack), wu...)
+	if _, err := c.Write(later); err != nil || len(under.writes) != 3 || !bytes.Equal(under.writes[2], later) {
+		t.Fatal("writes after the initial ACK pass without splitting", err)
+	}
+}
+
+func TestAckConnHandlesFragmentedPrefaceAndFrameHeaders(t *testing.T) {
+	under := &writesConn{}
+	c := &ackConn{Conn: under, prefaceLeft: len(h2Preface)}
+	badStream := frame(frameSettings, 1, 1, nil)
+	badLength := frame(frameSettings, 1, 0, make([]byte, 6))
+	ack := frame(frameSettings, 1, 0, nil)
+	wu := frame(frameWindowUpd, 0, 0, []byte{0, 0, 0, 1})
+	initial := append(append([]byte(h2Preface), badStream...), badLength...)
+	for _, chunk := range [][]byte{initial[:4], initial[4 : len(initial)-2], initial[len(initial)-2:]} {
+		if n, err := c.Write(chunk); n != len(chunk) || err != nil {
+			t.Fatalf("initial write %d, %v", n, err)
+		}
+	}
+	if c.done || len(under.writes) != 3 {
+		t.Fatalf("invalid ACK split the stream: %x", under.writes)
+	}
+	if _, err := c.Write(ack[:4]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(append(bytes.Clone(ack[4:]), wu...)); err != nil {
+		t.Fatal(err)
+	}
+	// A header split across writes is held until it can be classified, so
+	// the acknowledgement still goes in one write of its own.
+	if len(under.writes) != 5 || !bytes.Equal(under.writes[3], ack) || !bytes.Equal(under.writes[4], wu) {
+		t.Fatalf("writes %x", under.writes)
 	}
 }
 
@@ -298,5 +340,133 @@ func TestShapeConnFitsTheTargetsRecord(t *testing.T) {
 	}
 	if !bytes.Equal(under.writes[0], append(settings(0x3, 0x4), wu...)) {
 		t.Fatalf("first write %x: INITIAL_WINDOW_SIZE and MAX_CONCURRENT_STREAMS stay", under.writes[0])
+	}
+}
+
+// A decoder table smaller than the default must be announced: a peer that
+// assumes 4096 bytes would encode headers the server cannot decode.
+func TestFitSettingsKeepsASmallHeaderTable(t *testing.T) {
+	var p []byte
+	for _, id := range []uint16{0x5, 0x3, 0x6, 0x1, 0x4, 0x8} {
+		value := uint32(1 << 16)
+		if id == 0x1 {
+			value = 1024
+		}
+		p = binary.BigEndian.AppendUint16(p, id)
+		p = binary.BigEndian.AppendUint32(p, value)
+	}
+	goSettings := frame(frameSettings, 0, 0, p)
+	fitted := fitSettings(goSettings, frameHeaderLen+3*6)
+	found := false
+	for q := frameHeaderLen; fitted != nil && q+6 <= len(fitted); q += 6 {
+		if binary.BigEndian.Uint16(fitted[q:]) == 0x1 {
+			found = binary.BigEndian.Uint32(fitted[q+2:]) == 1024
+		}
+	}
+	if !found {
+		t.Fatalf("fitted SETTINGS %x dropped HEADER_TABLE_SIZE 1024", fitted)
+	}
+	if fitted := fitSettings(goSettings, frameHeaderLen+2*6); fitted != nil {
+		t.Fatalf("SETTINGS %x cannot carry the table size and must not be shaped", fitted)
+	}
+	// A default or larger table may go: the peer then assumes 4096.
+	if fitted := fitSettings(settings(0x5, 0x3, 0x6, 0x1, 0x4, 0x8), frameHeaderLen+2*6); fitted == nil {
+		t.Fatal("a 64 KiB table does not need announcing")
+	}
+}
+
+type failingStartupConn struct {
+	startupWritesConn
+	shape     *shapeConn
+	socket    *closeRecorder
+	tlsClosed bool
+}
+
+func (c *failingStartupConn) WritePaddedAppRecord([]byte, int) (int, error) {
+	return 0, net.ErrClosed
+}
+
+func (c *failingStartupConn) Write([]byte) (int, error) { return 0, net.ErrClosed }
+
+// Close would write a TLS close_notify, which a blocked socket delays.
+func (c *failingStartupConn) Close() error {
+	c.tlsClosed = true
+	return nil
+}
+
+func (c *failingStartupConn) NetConn() net.Conn { return c.socket }
+
+type closeRecorder struct {
+	net.Conn
+	shape    *shapeConn
+	closed   chan struct{}
+	unlocked bool
+}
+
+func (c *closeRecorder) Close() error {
+	if c.shape.mu.TryLock() {
+		c.unlocked = true
+		c.shape.mu.Unlock()
+	}
+	close(c.closed)
+	return nil
+}
+
+// When the deferred flush of SETTINGS fails, nothing else may write: the
+// socket must close rather than leave the peer waiting, without another TLS
+// record and without holding the lock later writes need for the error.
+func TestShapeConnClosesWhenTheDeferredFlushFails(t *testing.T) {
+	under := &failingStartupConn{}
+	c := &shapeConn{Conn: under, writer: under, profile: []reality.H2StartupRecord{
+		{Length: 62, Frames: []reality.H2StartupFrame{reality.H2Settings, reality.H2WindowUpdate}},
+		{Length: 31, Frames: []reality.H2StartupFrame{reality.H2SettingsAck}},
+	}}
+	under.socket = &closeRecorder{shape: c, closed: make(chan struct{})}
+	// SETTINGS waits for its WINDOW_UPDATE, which never comes.
+	if _, err := c.Write(settings(0x5, 0x3, 0x4)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-under.socket.closed:
+	case <-time.After(10 * shapeWait):
+		t.Fatal("the connection stayed open after the deferred flush failed")
+	}
+	if !under.socket.unlocked || under.tlsClosed {
+		t.Fatalf("closed under the lock %v, with a TLS close %v", !under.socket.unlocked, under.tlsClosed)
+	}
+	if _, err := c.Write([]byte("x")); err == nil {
+		t.Fatal("a later write did not return the startup error")
+	}
+}
+
+type failAfterConn struct {
+	writesConn
+	failing bool
+}
+
+func (c *failAfterConn) Write(b []byte) (int, error) {
+	if c.failing {
+		return 0, net.ErrClosed
+	}
+	return c.writesConn.Write(b)
+}
+
+// After a failed write the wrapper's view of the frame boundaries no longer
+// matches what the peer received: every later write fails.
+func TestAckConnWriteErrorIsTerminal(t *testing.T) {
+	under := &failAfterConn{}
+	c := &ackConn{Conn: under}
+	ack := frame(frameSettings, 1, 0, nil)
+	wu := frame(frameWindowUpd, 0, 0, []byte{0, 0, 0, 1})
+	if n, err := c.Write(ack[:4]); n != 4 || err != nil {
+		t.Fatalf("held header write %d, %v", n, err)
+	}
+	under.failing = true
+	if n, err := c.Write(append(bytes.Clone(ack[4:]), wu...)); err == nil || n != 0 {
+		t.Fatalf("failed write reported %d bytes, %v", n, err)
+	}
+	under.failing = false
+	if n, err := c.Write(ack[4:]); err == nil || n != 0 || len(under.writes) != 0 {
+		t.Fatalf("retry after a failed write: %d, %v, writes %x", n, err, under.writes)
 	}
 }
