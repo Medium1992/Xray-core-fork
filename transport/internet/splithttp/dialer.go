@@ -97,6 +97,11 @@ func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) str
 	return "2"
 }
 
+// handshakeTimeout bounds a client's TLS or REALITY handshake: one
+// blackholed after ClientHello would hold every request queued behind its
+// dial.
+const handshakeTimeout = 10 * time.Second
+
 func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
@@ -126,12 +131,23 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			return nil, err
 		}
 
-		// a handshake blackholed after ClientHello would hold every request queued behind this dial
-		ctxInner, cancel := context.WithTimeout(ctxInner, 10*time.Second)
+		ctxInner, cancel := context.WithTimeout(ctxInner, handshakeTimeout)
 		defer cancel()
+		// name the handshake and its bound in the log, which otherwise reads
+		// only "context deadline exceeded"
+		handshakeError := func(err error) error {
+			if ctxInner.Err() == context.DeadlineExceeded {
+				return errors.New("XHTTP: TLS handshake did not finish in ", handshakeTimeout).Base(err)
+			}
+			return err
+		}
 
 		if realityConfig != nil {
-			return reality.UClient(conn, realityConfig, ctxInner, dest)
+			uConn, err := reality.UClient(conn, realityConfig, ctxInner, dest)
+			if err != nil {
+				return nil, handshakeError(err)
+			}
+			return uConn, nil
 		}
 
 		if gotlsConfig != nil {
@@ -139,13 +155,13 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				conn = tls.UClient(conn, gotlsConfig, fingerprint)
 				if err := conn.(*tls.UConn).HandshakeContext(ctxInner); err != nil {
 					conn.Close()
-					return nil, err
+					return nil, handshakeError(err)
 				}
 			} else {
 				tlsConn := tls.Client(conn, gotlsConfig).(*tls.Conn)
 				if err := tlsConn.HandshakeContext(ctxInner); err != nil {
 					tlsConn.Close()
-					return nil, err
+					return nil, handshakeError(err)
 				}
 				conn = tlsConn
 			}
