@@ -192,10 +192,89 @@ func TestSniffSTUNRejectsOtherSniffersCorpus(t *testing.T) {
 func FuzzSniffSTUN(f *testing.F) {
 	f.Add(decode(&testing.T{}, rfc5769Request))
 	f.Add(message(0x0001))
+	// A datagram may be longer than the most a stream shows a sniffer.
+	f.Add(message(0x0001, attr(0x8022), make([]byte, MaxMessageLen-20)))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, streamErr := SniffSTUN(b)
-		if _, err := SniffSTUNDatagram(b); err == nil && streamErr != nil {
+		if _, err := SniffSTUNDatagram(b); err == nil && len(b) <= MaxMessageLen && streamErr != nil {
 			t.Fatalf("a whole datagram taken, the same bytes as a stream not: %v", streamErr)
 		}
 	})
+}
+
+// turnedDown reports whether err ends the sniff: neither "no clue yet" nor
+// "need more data".
+func turnedDown(err error) bool {
+	return err != nil && err != common.ErrNoClue && err != protocol.ErrProtoNeedMoreData
+}
+
+// A message longer than the dispatcher shows a sniffer (MaxMessageLen) is
+// turned down at once: waiting for it would keep the server reading, and
+// caching, a client's upload for the whole sniff budget.
+func TestSniffSTUNRejectsWhatTheCacheCannotShow(t *testing.T) {
+	for _, length := range []int{0xfffc, 0x7ff0, MaxMessageLen - 20 + 4} {
+		header := []byte{0x00, 0x01, byte(length >> 8), byte(length), 0x21, 0x12, 0xa4, 0x42}
+		if _, err := SniffSTUN(header); !turnedDown(err) {
+			t.Errorf("a header for %d bytes: %v, want it turned down", 20+length, err)
+		}
+	}
+	whole := message(0x0001, attr(0x8022), make([]byte, MaxMessageLen-20-4))
+	if len(whole) != MaxMessageLen {
+		t.Fatalf("test message of %d bytes", len(whole))
+	}
+	if _, err := SniffSTUN(whole); err != nil {
+		t.Fatalf("a whole message of MaxMessageLen bytes: %v", err)
+	}
+	// The RFC 4571 length counts towards what the cache shows.
+	frame := func(m []byte) []byte { return append(binary.BigEndian.AppendUint16(nil, uint16(len(m))), m...) }
+	if _, err := SniffSTUN(frame(whole)[:10]); !turnedDown(err) {
+		t.Errorf("an ICE-TCP frame of %d bytes: %v, want it turned down", 2+len(whole), err)
+	}
+	if fits := frame(message(0x0001, attr(0x8022), make([]byte, MaxMessageLen-20-4-4))); len(fits) > MaxMessageLen {
+		t.Fatalf("test frame of %d bytes", len(fits))
+	} else if _, err := SniffSTUN(fits); err != nil {
+		t.Errorf("an ICE-TCP frame of %d bytes: %v", len(fits), err)
+	}
+}
+
+// ICE-TCP sends each STUN message after the 2-byte length of RFC 4571 (RFC
+// 6544, section 7.1); the length must be that of the message.
+func TestSniffSTUNFramedForICETCP(t *testing.T) {
+	m := decode(t, rfc5769Request)
+	framed := binary.BigEndian.AppendUint16(nil, uint16(len(m)))
+	framed = append(framed, m...)
+	if _, err := SniffSTUN(framed); err != nil {
+		t.Fatalf("an ICE-TCP binding request: %v", err)
+	}
+	for n := 0; n < len(framed); n++ {
+		want := protocol.ErrProtoNeedMoreData
+		if n < 10 {
+			want = common.ErrNoClue
+		}
+		if _, err := SniffSTUN(framed[:n]); err != want {
+			t.Fatalf("%d of %d framed bytes: %v, want %v", n, len(framed), err, want)
+		}
+	}
+	wrong := append([]byte(nil), framed...)
+	wrong[1] += 4
+	if _, err := SniffSTUN(wrong); !turnedDown(err) {
+		t.Fatalf("a frame whose length is not the message's: %v, want it turned down", err)
+	}
+	if _, err := SniffSTUNDatagram(framed); err == nil {
+		t.Fatal("a framed message taken for a STUN datagram: UDP has no framing")
+	}
+}
+
+// Each rule of the header and the attributes turns down a message on its own.
+func TestSniffSTUNRulesOneByOne(t *testing.T) {
+	oddLength := message(0x0001, attr(0x8022), []byte("abc"))
+	oddLength[3]--
+	if _, err := SniffSTUN(oddLength[:12]); !turnedDown(err) {
+		t.Errorf("a header with a length not a multiple of 4: %v, want it turned down", err)
+	}
+	for n := 0; n < 8; n++ {
+		if _, err := SniffSTUNDatagram(decode(t, rfc5769Request)[:n]); !turnedDown(err) {
+			t.Errorf("a datagram of %d bytes: %v, want it turned down", n, err)
+		}
+	}
 }

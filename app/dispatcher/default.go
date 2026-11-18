@@ -24,7 +24,12 @@ import (
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
-var errSniffingTimeout = errors.New("timeout on sniffing")
+var (
+	errSniffingTimeout = errors.New("timeout on sniffing")
+	// errSniffingPastView ends a sniff that needs more data than the cache
+	// shows a sniffer: reading on would only cache the client's upload.
+	errSniffingPastView = errors.New("sniffing needs more data than the cache shows")
+)
 
 type cachedReader struct {
 	sync.Mutex
@@ -49,14 +54,27 @@ func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
 	return nil
 }
 
+// holdsMoreThan reports whether the cache holds bytes past payload, the
+// payload the last Cache returned: once it does, the payload is all a sniffer
+// sees of the cache, and further reads cannot show it more.
+func (r *cachedReader) holdsMoreThan(payload []byte) bool {
+	r.Lock()
+	defer r.Unlock()
+	return int(r.cache.Len()) > len(payload)
+}
+
 // Datagrams returns the cached buffers that the first size bytes of the
 // cache hold whole, each on its own. Each buffer of a UDP link is a datagram
 // of its own, so these are the datagrams of the flow. They are borrowed until
-// the cache is read.
+// the cache is read. It is nil for an empty cache, and empty when the first
+// buffer is longer than size.
 func (r *cachedReader) Datagrams(size int32) [][]byte {
 	r.Lock()
 	defer r.Unlock()
-	var datagrams [][]byte
+	if r.cache.IsEmpty() {
+		return nil
+	}
+	datagrams := make([][]byte, 0, len(r.cache))
 	for _, b := range r.cache {
 		if b.Len() > size {
 			break
@@ -394,10 +412,13 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 }
 
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
+	return sniffWith(ctx, cReader, metadataOnly, network, NewSniffer(ctx))
+}
+
+// sniffWith runs the sniff loop with the given sniffers.
+func sniffWith(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network, sniffer *Sniffer) (SniffResult, error) {
 	payload := buf.NewWithSize(32767)
 	defer payload.Release()
-
-	sniffer := NewSniffer(ctx)
 
 	metaresult, metadataErr := sniffer.SniffMetadata(ctx)
 
@@ -432,6 +453,10 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 						totalAttempt++
 					case protocol.ErrProtoNeedMoreData: // Protocol Need More Data: protocol matches, but need more data to complete sniffing
 						// in this case, do not add totalAttempt(allow to read until timeout)
+						// unless the sniffer has seen all it ever can.
+						if cReader.holdsMoreThan(payload.Bytes()) {
+							return nil, errSniffingPastView
+						}
 					default:
 						return result, err
 					}

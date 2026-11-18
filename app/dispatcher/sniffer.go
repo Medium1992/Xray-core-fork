@@ -44,7 +44,8 @@ type Sniffer struct {
 
 // sniffHTTPOrTracker is SniffHTTP but for an HTTP tracker request, which is
 // BitTorrent (BEP 3) riding on HTTP: its protocol is bittorrent, and its
-// domain is the HTTP Host, overridden as HTTP's is.
+// domain is the HTTP Host, overridden as HTTP's is. Like SniffHTTP it decides
+// from the request line.
 func sniffHTTPOrTracker(c context.Context, b []byte) (SniffResult, error) {
 	tracker, trackerErr := bittorrent.SniffHTTPTracker(b)
 	h, err := http.SniffHTTP(b, c)
@@ -74,26 +75,50 @@ func NewSniffer(ctx context.Context) *Sniffer {
 			{
 				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) },
 				// A SYN is a whole datagram: read the first one, not the batch.
-				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
+				datagramSniffer: func(_ context.Context, payload []byte, datagrams [][]byte) (SniffResult, error) {
+					if len(datagrams) == 0 {
+						return bittorrent.SniffUTP(payload)
+					}
 					return bittorrent.SniffUTPDatagram(datagrams[0])
 				},
 				network: net.Network_UDP,
 			},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffDHT(b) }, network: net.Network_UDP},
 			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUDPTracker(b) }, network: net.Network_UDP},
-			{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffLSD(b) }, network: net.Network_UDP},
 			{
 				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return stun.SniffSTUN(b) },
-				// A STUN message over UDP is its first datagram.
+				// A STUN message over UDP is its first datagram. An empty list of
+				// datagrams (the cache's first buffer is longer than the payload)
+				// has no first datagram to read whole, and a stream reader would
+				// take a datagram that only starts with one. A nil list (an empty
+				// cache) goes to the stream reader, as for every sniffer.
 				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
+					if len(datagrams) == 0 {
+						return nil, errUnknownContent
+					}
 					return stun.SniffSTUNDatagram(datagrams[0])
+				},
+				network: net.Network_UDP,
+			},
+			{
+				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffLSD(b) },
+				// An announce is a whole datagram: read the first one, and turn down
+				// an empty list rather than read a batch as one.
+				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
+					if len(datagrams) == 0 {
+						return nil, errUnknownContent
+					}
+					return bittorrent.SniffLSDDatagram(datagrams[0])
 				},
 				network: net.Network_UDP,
 			},
 			{
 				protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return discord.SniffIPDiscovery(b) },
 				// The request is the first datagram of a voice flow.
-				datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
+				datagramSniffer: func(_ context.Context, payload []byte, datagrams [][]byte) (SniffResult, error) {
+					if len(datagrams) == 0 {
+						return discord.SniffIPDiscovery(payload)
+					}
 					return discord.SniffIPDiscovery(datagrams[0])
 				},
 				network: net.Network_UDP,
@@ -129,7 +154,7 @@ func (s *Sniffer) SniffDatagrams(c context.Context, payload []byte, datagrams []
 		}
 		var result SniffResult
 		var err error
-		if si.datagramSniffer != nil && len(datagrams) != 0 {
+		if si.datagramSniffer != nil && datagrams != nil {
 			result, err = si.datagramSniffer(c, payload, datagrams)
 		} else {
 			result, err = protocolSniffer(c, payload)

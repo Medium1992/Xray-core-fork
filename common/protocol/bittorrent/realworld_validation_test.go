@@ -550,3 +550,54 @@ func TestSniffUTPRejectsNonUTPTraffic(t *testing.T) {
 		})
 	}
 }
+
+// A 20-byte query for a two-letter name with transaction id 0x4100 fills a
+// SYN's header exactly; only the DNS check keeps it out.
+func TestSniffUTPIgnoresBareTwoLetterDNSQueries(t *testing.T) {
+	for name, query := range map[string][]byte{
+		"type A":       {0x41, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 'a', 'i', 0x00, 0x00, 0x01, 0x00, 0x01},
+		"type AAAA":    {0x41, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 'i', 'o', 0x00, 0x00, 0x1c, 0x00, 0x01},
+		"with AD flag": {0x41, 0x00, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 'r', 'u', 0x00, 0x00, 0x01, 0x00, 0x01},
+	} {
+		if header, err := SniffUTP(query); err == nil && header != nil {
+			t.Errorf("%s: DNS query % x classified as bittorrent", name, query)
+		}
+	}
+}
+
+// RFC 1035 caps a name at 255 octets, its root label included.
+func TestIsDNSQueryNameLimit(t *testing.T) {
+	query := func(labels ...int) []byte {
+		b := []byte{0x41, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		for _, n := range labels {
+			b = append(b, byte(n))
+			b = append(b, strings.Repeat("a", n)...)
+		}
+		return append(b, 0x00, 0x00, 0x01, 0x00, 0x01)
+	}
+	if !isDNSQuery(query(63, 63, 63, 61)) {
+		t.Error("a 255-octet name is not read as a DNS query")
+	}
+	if isDNSQuery(query(63, 63, 63, 62)) {
+		t.Error("a 256-octet name is read as a DNS query")
+	}
+}
+
+// A datagram holds only the questions and records its length has room for,
+// so a SYN whose timestamp reads as larger counts is no DNS query, whatever
+// its window.
+func TestSniffUTPTakesSYNsWithImpossibleDNSCounts(t *testing.T) {
+	// Connection id 0x0100, window 0x3000 and sequence 0x0123 read as a
+	// root-name DNSKEY question; the timestamp reads as QDCOUNT 31037 and
+	// ANCOUNT 15766.
+	syn := []byte{0x41, 0x00, 0x01, 0x00, 0x79, 0x3d, 0x3d, 0x96, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x01, 0x23, 0x00, 0x00}
+	// The same SYN with µTorrent's extension bits: ten more bytes do not
+	// hold 31036 more questions and 15766 answers either.
+	withExtension := append(append([]byte{}, syn...), 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0)
+	withExtension[1] = 2
+	for _, b := range [][]byte{syn, withExtension} {
+		if _, err := SniffUTP(b); err != nil {
+			t.Errorf("SYN % x: %v", b, err)
+		}
+	}
+}

@@ -28,8 +28,8 @@ func newSniffer(ctx context.Context) Sniffer {
 	return *NewSniffer(ctx)
 }
 
-func sniff(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network, _ Sniffer) (SniffResult, error) {
-	return sniffer(ctx, cReader, metadataOnly, network)
+func sniff(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network, s Sniffer) (SniffResult, error) {
+	return sniffWith(ctx, cReader, metadataOnly, network, &s)
 }
 
 // defaultProtocolSniffers are the sniffers NewSniffer starts with, fake DNS
@@ -71,6 +71,15 @@ func newTestCachedReader(t *testing.T, link buf.TimeoutReader) *cachedReader {
 	})
 	return reader
 }
+
+// fixedSniffResult is a sniff result with a given protocol and domain.
+type fixedSniffResult struct {
+	protocol string
+	domain   string
+}
+
+func (r fixedSniffResult) Protocol() string { return r.protocol }
+func (r fixedSniffResult) Domain() string   { return r.domain }
 
 // countingReader is a datagramReader that counts the reads of its link.
 type countingReader struct {
