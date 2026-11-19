@@ -225,23 +225,29 @@ Individual browser connections to a target can use either grouping. Compare each
 handshake type using the selected PSK identity in ServerHello. An offer
 in ClientHello also appears when the target declines to resume.
 
-## Findings (2026-11-18, this PR's uTLS pin)
+## Findings (2026-11-19, uTLS f03e50a)
 
-The 2026-11-16 findings below used the Firefox 156, Edge 157 and Safari
-26.3 presets that are now proposed in Jolymmiles/utls#1. This PR keeps the
-pinned uTLS until that lands, and Firefox and Edge depend on it.
+uTLS at f03e50a (Jolymmiles/utls#1 and #2): Firefox 156, Edge 157 and
+Chrome's crypto/rand shuffle; `ios` is still iOS 14. RTT 60 ms, references
+straight to each target.
 
-- XHTTP, Chrome, through REALITY, against Chrome 157 straight to the
-  target. nginx at RTT 0 and 60 ms: full and resumed startups match.
-  nginx at 150 ms: only the response bytes in the second record differ
-  (146 against 148). Caddy and HAProxy at 60 ms: match. nginx gave Chrome
-  `[62, 146]`, `[188]` and `[62, 31]` within one run, which is why the
-  grouping follows the client's arrival.
-- XHTTP, Firefox: the pinned Firefox 148 preset sends neither
-  `session_ticket` nor `psk_key_exchange_modes`. The client therefore does
-  not ask for tickets, and the server answers it on the legacy path,
-  without HTTP/2 shaping. Every target differs from Firefox 160 until the
-  uTLS update.
+- ClientHellos, full and resumed: chrome, edge and firefox through REALITY
+  match Chrome 157, Edge 157, Firefox 156 and 160 at nginx, Caddy, HAProxy
+  and the stub. Firefox resumes with its own hello: no `session_ticket`,
+  GREASE ECH grown by the `pre_shared_key`.
+- XHTTP startups, full and resumed: Chrome and Firefox match at Caddy and
+  HAProxy, and Firefox at nginx. Chrome at nginx differs only in the
+  response bytes of its second record (146 against 147).
+- compat (old and new clients and servers) and edge (ticket expiry, a
+  mixed cluster, a replayed ClientHello) pass.
+- `ios`: its iOS 14 hello has no X25519MLKEM768 key share, so a REALITY
+  server answers it only with `allowX25519`, as before this pin.
+- Verify delay: the client waits after verifying REALITY's certificate
+  about 45 ms for chrome and 30 ms for edge, where Chrome and Edge took
+  6-16 ms and 4-12 ms on this machine in three runs today; firefox waits
+  3-5 ms, where Firefox took 13-142 ms. The references vary between runs
+  and the 2026-11-16 ones were closer; `verifyDelay` is not recalibrated
+  here.
 
 ## Findings (2026-11-16)
 
